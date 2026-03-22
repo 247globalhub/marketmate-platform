@@ -16,7 +16,7 @@
     "@monaco-editor/react": "^4.7.0",
     "axios": "^1.6.2",
     "firebase": "^12.9.0",
-    "google-auth-library": "^10.6.1",
+    "google-auth-library": "^10.6.2",
     "lucide-react": "^0.564.0",
     "monaco-editor": "^0.55.1",
     "node-fetch": "^2.7.0",
