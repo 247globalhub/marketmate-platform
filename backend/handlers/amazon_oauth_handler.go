@@ -167,14 +167,14 @@ func (h *AmazonOAuthHandler) OAuthLogin(c *gin.Context) {
 }
 
 // ============================================================================
-// PublicConnect — GET /api/v1/amazonnew/connect  (NO AUTH REQUIRED)
+// PublicConnect — GET /api/v1/amazon/connect  (NO AUTH REQUIRED)
 // ============================================================================
 // A shareable link that immediately redirects to the Amazon consent page.
 // The tenant_id is embedded in the URL so no login is needed.
 // Send this URL to a seller and they land directly on Amazon's auth screen.
 //
 // Example:
-//   https://marketmate-api-xxx.run.app/api/v1/amazonnew/connect?tenant=tenant-10007&marketplace_id=A1F83G8C2ARO7P&account_name=My+Store
+//   https://marketmate-api-xxx.run.app/api/v1/amazon/connect?tenant=tenant-10007&marketplace_id=A1F83G8C2ARO7P&account_name=My+Store
 //
 func (h *AmazonOAuthHandler) PublicConnect(c *gin.Context) {
 	tenantID := c.Query("tenant")
@@ -240,7 +240,7 @@ func (h *AmazonOAuthHandler) OAuthCallback(c *gin.Context) {
 			<p>Please close this window and try again.</p>
 			<script>
 				if (window.opener) {
-					window.opener.postMessage({type:'amazonnew-oauth-error',error:'%s'},'*');
+					window.opener.postMessage({type:'amazon-oauth-error',error:'%s'},'*');
 					setTimeout(()=>window.close(),4000);
 				}
 			</script>
@@ -336,7 +336,7 @@ func (h *AmazonOAuthHandler) OAuthCallback(c *gin.Context) {
 	// Find existing credential for this seller+marketplace
 	var existingCredID string
 	for _, cr := range creds {
-		if cr.Channel == "amazonnew" &&
+		if cr.Channel == "amazon" &&
 			cr.CredentialData["seller_id"] == sellerID &&
 			cr.CredentialData["marketplace_id"] == marketplaceID {
 			existingCredID = cr.CredentialID
@@ -368,11 +368,11 @@ func (h *AmazonOAuthHandler) OAuthCallback(c *gin.Context) {
 			log.Printf("[AmazonNew OAuth] Updated credential %s for seller %s", existingCredID, sellerID)
 		}
 	} else {
-		credID := fmt.Sprintf("cred-amazonnew-%d", time.Now().UnixMilli())
+		credID := fmt.Sprintf("cred-amazon-%d", time.Now().UnixMilli())
 		newCred := &models.MarketplaceCredential{
 			CredentialID:   credID,
 			TenantID:       tenantID,
-			Channel:        "amazonnew",
+			Channel:        "amazon",
 			AccountName:    accountName,
 			Environment:    "production",
 			Active:         true,
@@ -399,13 +399,13 @@ func (h *AmazonOAuthHandler) OAuthCallback(c *gin.Context) {
 			function notify() {
 				try {
 					if (window.opener && !window.opener.closed) {
-						window.opener.postMessage({type:'amazonnew-oauth-success',seller_id:'%s'},'*');
+						window.opener.postMessage({type:'amazon-oauth-success',seller_id:'%s'},'*');
 					}
 				} catch(e) {}
 			}
 			notify();
 			window.addEventListener('load', notify);
-			try { localStorage.setItem('amazonnew-oauth-result', JSON.stringify({type:'amazonnew-oauth-success',ts:Date.now()})); } catch(e) {}
+			try { localStorage.setItem('amazon-oauth-result', JSON.stringify({type:'amazon-oauth-success',ts:Date.now()})); } catch(e) {}
 			setTimeout(function(){ notify(); window.close(); }, 2000);
 		</script>
 	</body></html>`, accountName, sellerID, mpName, sellerID)))

@@ -34,21 +34,17 @@ import (
 //   BUNDLE COLUMN:
 //     bundle_component_skus
 //
-//   ATTRIBUTE COLUMNS (one named column per unique attribute key across all products):
-//     e.g. amazon_product_type, amazon_status, brand, color, manufacturer, model_number,
-//          part_number, size, source_quantity, style, ...
-//     Columns are sorted alphabetically. Each row only populates the columns
-//     relevant to its product type — other cells are empty (sparse).
-//     This format supports full round-trip: export → edit → re-import.
+//   ATTRIBUTE COLUMNS (name/value pairs, up to MaxAttrCols):
+//     attribute_1_name, attribute_1_value, ..., attribute_N_name, attribute_N_value
 //
-//   BACKWARDS COMPAT: attribute_N_name / attribute_N_value pairs are still
-//   accepted on import for files exported before this change.
+// This format is symmetrical: every exported file can be re-imported without
+// modification.
 // ============================================================================
 
 const (
 	MaxVariantAttrCols = 10 // max variant attribute name/value pairs
 	MaxImageCols       = 5  // fixed number of image slots
-	MaxAttrCols        = 25 // legacy: kept for import backwards compatibility only
+	MaxAttrCols        = 25 // max freeform attribute name/value pairs
 )
 
 type ExportService struct {
@@ -73,13 +69,11 @@ var FixedColumns = []string{
 }
 
 // buildHeaders constructs the full ordered header slice.
-// attrKeys is the sorted list of all unique attribute keys across all products —
-// each becomes its own named column (e.g. "color", "manufacturer", "size").
-func buildHeaders(numVariantAttrCols, numImageCols int, attrKeys []string) []string {
-	h := make([]string, 0, len(FixedColumns)+numVariantAttrCols*2+numImageCols+1+len(attrKeys))
+func buildHeaders(numVariantAttrCols, numImageCols, numAttrCols int) []string {
+	h := make([]string, 0, len(FixedColumns)+numVariantAttrCols*2+numImageCols+1+numAttrCols*2)
 	h = append(h, FixedColumns...)
 
-	// variant attribute name/value pairs (kept as name/value for variants)
+	// variant attribute name/value pairs
 	for i := 1; i <= numVariantAttrCols; i++ {
 		h = append(h, fmt.Sprintf("variant_attr_%d_name", i))
 		h = append(h, fmt.Sprintf("variant_attr_%d_value", i))
@@ -93,8 +87,11 @@ func buildHeaders(numVariantAttrCols, numImageCols int, attrKeys []string) []str
 	// bundle
 	h = append(h, "bundle_component_skus")
 
-	// one named column per unique attribute key (sparse — most cells empty per row)
-	h = append(h, attrKeys...)
+	// freeform attribute name/value pairs
+	for i := 1; i <= numAttrCols; i++ {
+		h = append(h, fmt.Sprintf("attribute_%d_name", i))
+		h = append(h, fmt.Sprintf("attribute_%d_value", i))
+	}
 
 	return h
 }
@@ -144,25 +141,28 @@ func (s *ExportService) ExportProducts(ctx context.Context, tenantID string, fil
 		productSKU[p.ProductID] = resolveProductSKU(&p, variantsByProduct[p.ProductID])
 	}
 
-	// ── PASS 1: collect all unique attribute keys and variant attr counts ──
-	// Attributes stored internally (not exported as named columns)
+	// ── PASS 1: discover max attribute counts ──
 	internal := map[string]bool{
 		"source_sku": true, "source_price": true, "source_currency": true,
 		"source_marketplace": true, "bullet_points": true, "sku": true,
 		"fulfillment_channel": true,
 	}
 
-	// Collect every unique freeform attribute key across all products.
-	// Each unique key becomes its own named column in the export.
-	attrKeySet := map[string]bool{}
+	// Collect all unique freeform attribute keys (ordered) per product
+	// and variant attribute keys per variant, to determine column counts.
+	maxFreeformAttrs := 0
 	maxVariantAttrs := 0
 
 	for _, p := range products {
 		if p.Attributes != nil {
+			count := 0
 			for key := range p.Attributes {
 				if !internal[key] && key != "bullet_points" {
-					attrKeySet[key] = true
+					count++
 				}
+			}
+			if count > maxFreeformAttrs {
+				maxFreeformAttrs = count
 			}
 		}
 	}
@@ -173,19 +173,24 @@ func (s *ExportService) ExportProducts(ctx context.Context, tenantID string, fil
 		}
 	}
 
-	// Sort attribute keys for deterministic column ordering
-	attrKeys := sortedKeys(attrKeySet)
-
-	// Cap variant attr cols
+	// Cap at maximums
 	numVariantAttrCols := maxVariantAttrs
 	if numVariantAttrCols > MaxVariantAttrCols {
 		numVariantAttrCols = MaxVariantAttrCols
 	}
+	numAttrCols := maxFreeformAttrs
+	if numAttrCols > MaxAttrCols {
+		numAttrCols = MaxAttrCols
+	}
+	// Always emit at least 1 slot for readability
 	if numVariantAttrCols < 1 {
 		numVariantAttrCols = 1
 	}
+	if numAttrCols < 1 {
+		numAttrCols = 1
+	}
 
-	allHeaders := buildHeaders(numVariantAttrCols, MaxImageCols, attrKeys)
+	allHeaders := buildHeaders(numVariantAttrCols, MaxImageCols, numAttrCols)
 	colIdx := map[string]int{}
 	for i, h := range allHeaders {
 		colIdx[h] = i
@@ -197,7 +202,7 @@ func (s *ExportService) ExportProducts(ctx context.Context, tenantID string, fil
 		if p.ProductType == "variant" {
 			continue
 		}
-		rows = append(rows, productToRow(&p, productSKU, colIdx, allHeaders, numVariantAttrCols, attrKeys, internal))
+		rows = append(rows, productToRow(&p, productSKU, colIdx, allHeaders, numVariantAttrCols, numAttrCols, internal))
 		if p.ProductType == "parent" {
 			psku := productSKU[p.ProductID]
 			for _, v := range variantsByProduct[p.ProductID] {
@@ -220,7 +225,7 @@ func (s *ExportService) ExportProducts(ctx context.Context, tenantID string, fil
 // ROW BUILDERS
 // ============================================================================
 
-func productToRow(p *models.Product, productSKU map[string]string, colIdx map[string]int, headers []string, numVariantAttrCols int, attrKeys []string, internal map[string]bool) []string {
+func productToRow(p *models.Product, productSKU map[string]string, colIdx map[string]int, headers []string, numVariantAttrCols, numAttrCols int, internal map[string]bool) []string {
 	row := make([]string, len(headers))
 	set := func(col, val string) {
 		if idx, ok := colIdx[col]; ok && val != "" {
@@ -287,13 +292,24 @@ func productToRow(p *models.Product, productSKU map[string]string, colIdx map[st
 		set("bundle_component_skus", strings.Join(parts, "|"))
 	}
 
-	// Freeform attributes — write each value into its named column
+	// Freeform attributes as name/value pairs
 	if p.Attributes != nil {
-		for _, key := range attrKeys {
+		// Collect and sort keys for deterministic ordering
+		var attrKeys []string
+		for key := range p.Attributes {
 			if !internal[key] && key != "bullet_points" {
-				if s := attrToString(p.Attributes[key]); s != "" {
-					set(key, s)
-				}
+				attrKeys = append(attrKeys, key)
+			}
+		}
+		sort.Strings(attrKeys)
+		for i, key := range attrKeys {
+			slot := i + 1
+			if slot > numAttrCols {
+				break
+			}
+			if s := attrToString(p.Attributes[key]); s != "" {
+				set(fmt.Sprintf("attribute_%d_name", slot), key)
+				set(fmt.Sprintf("attribute_%d_value", slot), s)
 			}
 		}
 	}
@@ -389,6 +405,8 @@ func variantToRow(v *models.Variant, parentSKU string, colIdx map[string]int, he
 // ============================================================================
 // PRICE & STOCK EXPORTS
 // ============================================================================
+
+
 
 func (s *ExportService) ExportPrices(ctx context.Context, tenantID string) (*ExportResult, error) {
 	full, err := s.ExportProducts(ctx, tenantID, map[string]interface{}{})

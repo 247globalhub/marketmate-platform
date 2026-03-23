@@ -257,13 +257,24 @@ type CreditLedger struct {
 // GlobalUser is stored at /global_users/{user_id}
 // One document per real person, regardless of how many tenants they belong to.
 type GlobalUser struct {
-	UserID      string    `json:"user_id"      firestore:"user_id"`
-	FirebaseUID string    `json:"firebase_uid" firestore:"firebase_uid"` // links to Firebase Auth
-	Email       string    `json:"email"        firestore:"email"`
-	DisplayName string    `json:"display_name" firestore:"display_name"`
-	AvatarURL   string    `json:"avatar_url,omitempty" firestore:"avatar_url,omitempty"`
-	CreatedAt   time.Time `json:"created_at"   firestore:"created_at"`
-	LastLoginAt time.Time `json:"last_login_at" firestore:"last_login_at"`
+	UserID        string    `json:"user_id"        firestore:"user_id"`
+	FirebaseUID   string    `json:"firebase_uid"   firestore:"firebase_uid"`
+	Email         string    `json:"email"          firestore:"email"`
+	DisplayName   string    `json:"display_name"   firestore:"display_name"`
+	AvatarURL     string    `json:"avatar_url,omitempty"     firestore:"avatar_url,omitempty"`
+	Phone         string    `json:"phone,omitempty"          firestore:"phone,omitempty"`
+	PhoneVerified bool      `json:"phone_verified"           firestore:"phone_verified"`
+	PhoneChannel  string    `json:"phone_channel,omitempty"  firestore:"phone_channel,omitempty"` // "sms" | "whatsapp"
+	NotifPrefs    NotifPrefs `json:"notif_prefs"             firestore:"notif_prefs"`
+	CreatedAt     time.Time `json:"created_at"     firestore:"created_at"`
+	LastLoginAt   time.Time `json:"last_login_at"  firestore:"last_login_at"`
+}
+
+// NotifPrefs controls how a user receives messaging assignment alerts.
+type NotifPrefs struct {
+	Email    bool `json:"email"    firestore:"email"`
+	SMS      bool `json:"sms"      firestore:"sms"`
+	WhatsApp bool `json:"whatsapp" firestore:"whatsapp"`
 }
 
 // ── Tenant Membership ─────────────────────────────────────────────────────────
@@ -425,8 +436,15 @@ type UserMembership struct {
 	GroupIDs       []string         `json:"group_ids,omitempty" firestore:"group_ids,omitempty"`
 	// DisplayNameHint is set at invite time so the invitee name can be pre-populated.
 	DisplayNameHint string          `json:"display_name_hint,omitempty" firestore:"display_name_hint,omitempty"`
-	// MessagingNotifPrefs holds how this member wants to be notified about message assignments.
-	MessagingNotifPrefs *MessagingNotificationPrefs `json:"messaging_notif_prefs,omitempty" firestore:"messaging_notif_prefs,omitempty"`
+	// MessagingNotifPrefs holds per-member messaging notification preferences.
+	MessagingNotifPrefs *MessagingNotifPrefs `json:"messaging_notif_prefs,omitempty" firestore:"messaging_notif_prefs,omitempty"`
+}
+
+// MessagingNotifPrefs controls how a team member receives messaging assignment alerts.
+type MessagingNotifPrefs struct {
+	Email    string   `json:"email,omitempty"    firestore:"email,omitempty"`    // override email address
+	Phone    string   `json:"phone,omitempty"    firestore:"phone,omitempty"`    // phone number for SMS/WhatsApp
+	Channels []string `json:"channels,omitempty" firestore:"channels,omitempty"` // ["email","sms","whatsapp"]
 }
 
 // ── Invitations ───────────────────────────────────────────────────────────────

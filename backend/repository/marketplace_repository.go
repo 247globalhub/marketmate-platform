@@ -759,7 +759,7 @@ func (r *MarketplaceRepository) GetUnenrichedProductASINs(ctx context.Context, t
 func (r *MarketplaceRepository) GetFirstAmazonCredentialID(ctx context.Context, tenantID string) (string, error) {
 	iter := r.client.Collection("tenants").Doc(tenantID).
 		Collection("marketplace_credentials").
-		Where("channel", "==", "amazon").
+		Where("channel", "in", []interface{}{"amazon"}).
 		Where("active", "==", true).
 		Limit(1).
 		Documents(ctx)

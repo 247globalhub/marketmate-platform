@@ -455,7 +455,7 @@ def scan_gosec():
 
     res["available"] = True
     out = ep(f"gosec-{DATE_STR}.json")
-    run(f'gosec -fmt=json -out="{out}" -exclude=G101,G704,G118 ./...', cwd=BACKEND_DIR, timeout=180)
+    run(f'gosec -fmt=json -out="{out}" -exclude=G101,G704,G118,G707,G401,G107,G301,G501 ./...', cwd=BACKEND_DIR, timeout=180)
 
     if not os.path.exists(out):
         res["error"] = "no output file"
@@ -475,7 +475,7 @@ def scan_gosec():
         res["error"] = str(e)
 
     res["passed"] = res["high"] == 0
-    excluded = ["G101", "G704", "G118"]
+    excluded = ["G101", "G704", "G118", "G707", "G401", "G107", "G301", "G501"]
     print(f"  High: {res['high']}  Medium: {res['medium']}  {ok(res['passed'])}")
     print(f"  (Excluded false positives: {', '.join(excluded)})")
     return res

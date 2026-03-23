@@ -54,6 +54,7 @@ parser.add_argument("--dry-run",   action="store_true", help="Count only, don't 
 parser.add_argument("--limit",     type=int, default=0, help="Max products to re-enrich (0=all)")
 parser.add_argument("--cred-id",   default="",          help="Override credential ID")
 parser.add_argument("--run-id",    default="",          help="Unique run ID to avoid task name collisions (auto-generated if not set)")
+parser.add_argument("--all",       action="store_true", help="Re-enrich ALL products with an ASIN, not just unenriched ones")
 args = parser.parse_args()
 
 # Auto-generate run-id from timestamp if not provided — ensures task names are
@@ -189,7 +190,10 @@ if not cred_id:
 
 # ── Step 2: Find unenriched products ─────────────────────────────────────────
 print(f"\nStep 2: Scanning for unenriched products (this may take a minute)...")
-print(f"  Strategy: products with no brand AND no description AND have an ASIN")
+if args.all:
+    print(f"  Strategy: ALL products with an ASIN (--all flag set)")
+else:
+    print(f"  Strategy: products with no brand AND no description AND have an ASIN")
 
 unenriched    = []
 next_page     = None
@@ -236,7 +240,7 @@ while True:
         asin        = identifiers.get("asin", {}).get("stringValue", "").strip()
         pid         = doc.get("name", "").split("/")[-1]
 
-        if not brand and not description and asin:
+        if asin and (args.all or (not brand and not description)):
             unenriched.append({"product_id": pid, "asin": asin})
 
     if page_num % 10 == 0:

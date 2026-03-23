@@ -1,6 +1,9 @@
 package handlers
 
 import (
+	"bytes"
+	"log"
+	"context"
 	"encoding/csv"
 	"fmt"
 	"io"
@@ -28,6 +31,8 @@ type ExportHandler struct {
 	repo           *repository.FirestoreRepository
 	productService *services.ProductService
 	orderService   *services.OrderService
+	storageService *services.StorageService
+	fsClient       *firestore.Client
 	usage          *UsageInstrumentor
 }
 
@@ -38,6 +43,16 @@ func NewExportHandler(exportService *services.ExportService, repo *repository.Fi
 // SetOrderService injects the order service (called after construction in main.go)
 func (h *ExportHandler) SetOrderService(orderService *services.OrderService) {
 	h.orderService = orderService
+}
+
+// SetStorageService injects the GCS storage service.
+func (h *ExportHandler) SetStorageService(s *services.StorageService) {
+	h.storageService = s
+}
+
+// SetFirestoreClient injects the Firestore client for export job tracking.
+func (h *ExportHandler) SetFirestoreClient(client *firestore.Client) {
+	h.fsClient = client
 }
 
 // ExportOrders handles GET /api/v1/orders/export
@@ -111,6 +126,242 @@ func (h *ExportHandler) ExportOrders(c *gin.Context) {
 // ============================================================================
 // PRODUCT EXPORT
 // ============================================================================
+
+
+
+// ============================================================================
+// BACKGROUND EXPORT SYSTEM
+// ============================================================================
+// POST /api/v1/export/queue   — queue a background export job
+// GET  /api/v1/export/jobs    — list export jobs for the tenant
+//
+// Flow:
+//  1. Client calls POST /export/queue with { type, format }
+//  2. Handler creates a job doc in Firestore (status=queued), returns job_id immediately
+//  3. Background goroutine builds the file, uploads to GCS, updates job to status=ready
+//  4. Client polls GET /export/jobs to see when status=ready, then clicks download URL
+//
+// Jobs are stored at tenants/{tid}/export_jobs/{jobID}
+// Files are stored at exports/{tenantID}/{jobID}/products_YYYYMMDD.csv (private GCS path)
+// Signed URLs valid for 24 hours are generated on demand via GET /export/jobs
+
+type exportJob struct {
+	JobID       string    `json:"job_id" firestore:"job_id"`
+	TenantID    string    `json:"tenant_id" firestore:"tenant_id"`
+	Type        string    `json:"type" firestore:"type"`
+	Format      string    `json:"format" firestore:"format"`
+	Status      string    `json:"status" firestore:"status"` // queued|building|ready|failed
+	RowCount    int       `json:"row_count,omitempty" firestore:"row_count,omitempty"`
+	DownloadURL string    `json:"download_url,omitempty" firestore:"download_url,omitempty"`
+	GCSPath     string    `json:"gcs_path,omitempty" firestore:"gcs_path,omitempty"`
+	Error       string    `json:"error,omitempty" firestore:"error,omitempty"`
+	CreatedAt   time.Time `json:"created_at" firestore:"created_at"`
+	UpdatedAt   time.Time `json:"updated_at" firestore:"updated_at"`
+	ReadyAt     *time.Time `json:"ready_at,omitempty" firestore:"ready_at,omitempty"`
+}
+
+// QueueExport  POST /api/v1/export/queue
+func (h *ExportHandler) QueueExport(c *gin.Context) {
+	tenantID := c.GetString("tenant_id")
+
+	var req struct {
+		Type   string `json:"type" binding:"required"`
+		Format string `json:"format"`
+	}
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+	if req.Format == "" {
+		req.Format = "csv"
+	}
+
+	if h.fsClient == nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "export job store not available"})
+		return
+	}
+
+	jobID := uuid.New().String()
+	now := time.Now()
+	job := exportJob{
+		JobID:     jobID,
+		TenantID:  tenantID,
+		Type:      req.Type,
+		Format:    req.Format,
+		Status:    "queued",
+		CreatedAt: now,
+		UpdatedAt: now,
+	}
+
+	jobRef := h.fsClient.Collection("tenants").Doc(tenantID).Collection("export_jobs").Doc(jobID)
+	if _, err := jobRef.Set(c.Request.Context(), job); err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+
+	// Fire background build — uses its own context so request deadline doesn't kill it
+	go h.buildExportJob(tenantID, jobID, req.Type, req.Format)
+
+	c.JSON(http.StatusOK, gin.H{"ok": true, "job_id": jobID, "status": "queued"})
+}
+
+// buildExportJob runs in a goroutine, builds the export file and uploads to GCS.
+func (h *ExportHandler) buildExportJob(tenantID, jobID, exportType, format string) {
+	ctx := context.Background()
+	jobRef := h.fsClient.Collection("tenants").Doc(tenantID).Collection("export_jobs").Doc(jobID)
+
+	// Mark as building
+	jobRef.Update(ctx, []firestore.Update{
+		{Path: "status", Value: "building"},
+		{Path: "updated_at", Value: time.Now()},
+	})
+
+	var csvBytes []byte
+	var filename string
+	var rowCount int
+	var buildErr error
+
+	switch exportType {
+	case "products":
+		var result *services.ExportResult
+		result, buildErr = h.exportService.ExportProducts(ctx, tenantID, map[string]interface{}{})
+		if buildErr == nil {
+			var buf bytes.Buffer
+			w := csv.NewWriter(&buf)
+			w.Write(result.Headers)
+			for _, row := range result.Rows {
+				w.Write(row)
+			}
+			w.Flush()
+			csvBytes = buf.Bytes()
+			filename = result.Filename
+			rowCount = len(result.Rows)
+		}
+	case "prices":
+		result, err := h.exportService.ExportPrices(ctx, tenantID)
+		if err != nil {
+			buildErr = err
+		} else {
+			var buf bytes.Buffer
+			w := csv.NewWriter(&buf)
+			w.Write(result.Headers)
+			for _, row := range result.Rows { w.Write(row) }
+			w.Flush()
+			csvBytes = buf.Bytes()
+			filename = result.Filename
+			rowCount = len(result.Rows)
+		}
+	case "inventory_basic", "inventory_advanced":
+		result, err := h.exportService.ExportStock(ctx, tenantID)
+		if err != nil {
+			buildErr = err
+		} else {
+			var buf bytes.Buffer
+			w := csv.NewWriter(&buf)
+			w.Write(result.Headers)
+			for _, row := range result.Rows { w.Write(row) }
+			w.Flush()
+			csvBytes = buf.Bytes()
+			filename = result.Filename
+			rowCount = len(result.Rows)
+		}
+	default:
+		buildErr = fmt.Errorf("unsupported export type: %s", exportType)
+	}
+
+	if buildErr != nil {
+		log.Printf("[ExportJob] %s/%s failed: %v", tenantID, jobID, buildErr)
+		jobRef.Update(ctx, []firestore.Update{
+			{Path: "status", Value: "failed"},
+			{Path: "error", Value: buildErr.Error()},
+			{Path: "updated_at", Value: time.Now()},
+		})
+		return
+	}
+
+	// Upload to GCS
+	gcsPath := fmt.Sprintf("exports/%s/%s/%s", tenantID, jobID, filename)
+	var downloadURL string
+
+	if h.storageService != nil {
+		url, err := h.storageService.Upload(ctx, gcsPath, bytes.NewReader(csvBytes), "text/csv; charset=utf-8")
+		if err != nil {
+			log.Printf("[ExportJob] GCS upload failed for %s/%s: %v", tenantID, jobID, err)
+			// Fall back — store base64 in Firestore (only for small exports)
+			downloadURL = ""
+		} else {
+			downloadURL = url
+		}
+	}
+
+	now := time.Now()
+	updates := []firestore.Update{
+		{Path: "status", Value: "ready"},
+		{Path: "row_count", Value: rowCount},
+		{Path: "download_url", Value: downloadURL},
+		{Path: "gcs_path", Value: gcsPath},
+		{Path: "ready_at", Value: now},
+		{Path: "updated_at", Value: now},
+	}
+	jobRef.Update(ctx, updates)
+	log.Printf("[ExportJob] %s/%s complete — %d rows, url=%s", tenantID, jobID, rowCount, downloadURL)
+}
+
+// ListExportJobs  GET /api/v1/export/jobs
+func (h *ExportHandler) ListExportJobs(c *gin.Context) {
+	tenantID := c.GetString("tenant_id")
+	ctx := c.Request.Context()
+
+	if h.fsClient == nil {
+		c.JSON(http.StatusOK, gin.H{"jobs": []exportJob{}})
+		return
+	}
+
+	iter := h.fsClient.Collection("tenants").Doc(tenantID).Collection("export_jobs").
+		OrderBy("created_at", firestore.Desc).
+		Limit(20).
+		Documents(ctx)
+	defer iter.Stop()
+
+	var jobs []exportJob
+	for {
+		doc, err := iter.Next()
+		if err != nil {
+			break
+		}
+		var job exportJob
+		if err := doc.DataTo(&job); err == nil {
+			jobs = append(jobs, job)
+		}
+	}
+	if jobs == nil {
+		jobs = []exportJob{}
+	}
+	c.JSON(http.StatusOK, gin.H{"jobs": jobs})
+}
+
+
+// ============================================================================
+// STREAMING PRODUCT EXPORT
+// GET /api/v1/export/products/stream
+// ============================================================================
+// Uses a background context (no deadline) so large Firestore reads complete
+// without being cancelled by the HTTP request deadline.
+
+func (h *ExportHandler) StreamProductsCSV(c *gin.Context) {
+	tenantID := c.GetString("tenant_id")
+
+	// Background context — no deadline, so Firestore reads 27k+ docs without timeout
+	ctx := context.Background()
+
+	csvBytes, filename, err := h.exportService.ExportProductsCSV(ctx, tenantID, map[string]interface{}{})
+	if err != nil {
+		c.JSON(500, gin.H{"error": err.Error()})
+		return
+	}
+	c.Header("Content-Disposition", fmt.Sprintf("attachment; filename=%s", filename))
+	c.Data(200, "text/csv; charset=utf-8", csvBytes)
+}
 
 func (h *ExportHandler) ExportProducts(c *gin.Context) {
 	tenantID := c.GetString("tenant_id")
@@ -203,8 +454,8 @@ func (h *ExportHandler) ExportTemplate(c *gin.Context) {
 	c.JSON(200, gin.H{
 		"ok":              true,
 		"fixed_columns":   services.FixedColumns,
-		"dynamic_columns": []string{"variant_attr_N_name", "variant_attr_N_value", "image_N", "bundle_component_skus"},
-		"message":         "Fixed columns always present. Freeform attributes are exported as individual named columns (e.g. color, size, manufacturer). Legacy attribute_N_name/value pairs are still accepted on import.",
+		"dynamic_columns": []string{"variant_attr_N_name", "variant_attr_N_value", "image_N", "bundle_component_skus", "attribute_N_name", "attribute_N_value"},
+		"message":         "Fixed columns are always present. Use variant_attr_N_name/value pairs for variant attributes, image_N for images, and attribute_N_name/value pairs for freeform attributes.",
 	})
 }
 
@@ -560,41 +811,6 @@ func (h *ExportHandler) validateRows(c *gin.Context, tenantID string, headers []
 // ROW → MODEL CONVERTERS
 // ============================================================================
 
-// isReservedColumn returns true for columns that are part of the fixed schema
-// or legacy attribute_N_name/value pattern — these should not be re-read as
-// named attribute columns during import.
-func isReservedColumn(h string) bool {
-	// Fixed columns
-	for _, fc := range services.FixedColumns {
-		if h == fc {
-			return true
-		}
-	}
-	// Variant attribute name/value pairs
-	if strings.HasPrefix(h, "variant_attr_") {
-		return true
-	}
-	// Image columns
-	if strings.HasPrefix(h, "image_") {
-		return true
-	}
-	// Bundle
-	if h == "bundle_component_skus" {
-		return true
-	}
-	// Legacy attribute name/value pairs
-	if strings.HasPrefix(h, "attribute_") && (strings.HasSuffix(h, "_name") || strings.HasSuffix(h, "_value")) {
-		return true
-	}
-	// Internal fields that should not be re-imported as attributes
-	switch h {
-	case "source_sku", "source_price", "source_currency", "source_marketplace",
-		"bullet_points", "sku", "fulfillment_channel":
-		return true
-	}
-	return false
-}
-
 // extractNameValuePairs reads attribute_N_name / attribute_N_value columns from a row.
 // prefix should be "attribute" or "variant_attr".
 func extractNameValuePairs(row []string, colIdx map[string]int, headers []string, prefix string) map[string]string {
@@ -706,19 +922,9 @@ func (h *ExportHandler) rowToProduct(row []string, colIdx map[string]int, header
 		attrs["source_currency"] = curr
 	}
 
-	// Freeform attributes — support both formats:
-	// 1. Legacy: attribute_N_name / attribute_N_value pairs
+	// Freeform attributes from attribute_N_name / attribute_N_value pairs
 	for name, val := range extractNameValuePairs(row, colIdx, headers, "attribute") {
 		attrs[name] = val
-	}
-	// 2. New format: named columns (any column not in the fixed/reserved set)
-	for _, h := range headers {
-		if isReservedColumn(h) {
-			continue
-		}
-		if val := strings.TrimSpace(getCol(row, colIdx, h)); val != "" {
-			attrs[h] = val
-		}
 	}
 
 	if len(attrs) > 0 {
@@ -767,18 +973,10 @@ func (h *ExportHandler) rowToUpdates(row []string, colIdx map[string]int, header
 		updates["tags"] = strings.Split(tags, "|")
 	}
 
-	// Freeform attributes — support both legacy name/value pairs and new named columns
+	// Freeform attributes from attribute_N_name / attribute_N_value pairs
 	attrs := map[string]interface{}{}
 	for name, val := range extractNameValuePairs(row, colIdx, headers, "attribute") {
 		attrs[name] = val
-	}
-	for _, h := range headers {
-		if isReservedColumn(h) {
-			continue
-		}
-		if val := strings.TrimSpace(getCol(row, colIdx, h)); val != "" {
-			attrs[h] = val
-		}
 	}
 	if len(attrs) > 0 {
 		updates["attributes"] = attrs

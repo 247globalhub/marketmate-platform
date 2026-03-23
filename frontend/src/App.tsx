@@ -107,6 +107,7 @@ const ApiKeys              = lazy(() => import('./pages/settings/ApiKeys'));
 const CurrencySettings     = lazy(() => import('./pages/settings/CurrencySettings'));
 const EmailSettings        = lazy(() => import('./pages/settings/EmailSettings'));
 const NotificationSettings = lazy(() => import('./pages/settings/NotificationSettings'));
+const ProfileSettings      = lazy(() => import('./pages/settings/ProfileSettings'));
 
 // ── Dev / Admin ───────────────────────────────────────────────────────────────
 const OpsConsole          = lazy(() => import('./pages/OpsConsole'));
@@ -240,6 +241,7 @@ function App() {
             <Route path="/settings/currency" element={<CurrencySettings />} />
             <Route path="/settings/email" element={<EmailSettings />} />
             <Route path="/settings/notifications" element={<NotificationSettings />} />
+            <Route path="/settings/profile" element={<ProfileSettings />} />
 
             {/* ── Dev / Admin ───────────────────────────────────────────────── */}
             <Route path="/ops" element={<OpsConsole />} />

@@ -124,30 +124,24 @@ func (r *FirestoreRepository) DeleteProduct(ctx context.Context, tenantID, produ
 func (r *FirestoreRepository) ListProducts(ctx context.Context, tenantID string, filters map[string]interface{}, limit, offset int) ([]models.Product, int64, error) {
 	baseQuery := r.client.Collection("tenants").Doc(tenantID).Collection("products")
 
-	// Apply status filter first if present, then OrderBy.
-	// Combining Where + OrderBy on different fields requires a composite index.
-	// To avoid that, we only OrderBy when not filtering by status.
-	hasStatusFilter := false
+	// Determine if a filter is applied
+	hasFilter := false
 	var query firestore.Query
 	if parentID, ok := filters["parent_id"].(string); ok && parentID != "" {
-		// Filter by parent_id — children of a variable product
 		query = baseQuery.Where("parent_id", "==", parentID)
-		hasStatusFilter = true // skip OrderBy to avoid composite index
+		hasFilter = true
 	} else if parentASIN, ok := filters["parent_asin"].(string); ok && parentASIN != "" {
-		// Filter by attributes.parent_asin — children linked by Amazon ASIN
 		query = baseQuery.Where("attributes.parent_asin", "==", parentASIN)
-		hasStatusFilter = true
+		hasFilter = true
 	} else if status, ok := filters["status"].(string); ok && status != "" {
 		query = baseQuery.Where("status", "==", status)
-		hasStatusFilter = true
-	} else {
-		query = baseQuery.OrderBy("created_at", firestore.Desc)
+		hasFilter = true
 	}
-	_ = hasStatusFilter
+	_ = hasFilter
 	
-	// Use Firestore native Count() aggregation — O(1) regardless of collection size
+	// Count using baseQuery (works on CollectionRef, not zero-value Query)
 	var total int64
-	countResult, err := query.NewAggregationQuery().WithCount("count").Get(ctx)
+	countResult, err := baseQuery.NewAggregationQuery().WithCount("count").Get(ctx)
 	if err == nil {
 		if countVal, ok := countResult["count"]; ok {
 			switch v := countVal.(type) {
@@ -160,16 +154,32 @@ func (r *FirestoreRepository) ListProducts(ctx context.Context, tenantID string,
 	} else {
 		log.Printf("[Repo] ListProducts count aggregation failed, using 0: %v", err)
 	}
-	
-	// Apply pagination
-	if offset > 0 {
-		query = query.Offset(offset)
+
+	// Build iterator — for no-filter case use baseQuery (CollectionRef) directly.
+	// Using the embedded firestore.Query from CollectionRef causes pagination to
+	// stop after ~1000 docs. Using CollectionRef.Documents() iterates all pages.
+	var iter *firestore.DocumentIterator
+	if !hasFilter {
+		cr := r.client.Collection("tenants").Doc(tenantID).Collection("products")
+		switch {
+		case limit > 0 && offset > 0:
+			iter = cr.Offset(offset).Limit(limit).Documents(ctx)
+		case limit > 0:
+			iter = cr.Limit(limit).Documents(ctx)
+		case offset > 0:
+			iter = cr.Offset(offset).Documents(ctx)
+		default:
+			iter = cr.Documents(ctx)
+		}
+	} else {
+		if offset > 0 {
+			query = query.Offset(offset)
+		}
+		if limit > 0 {
+			query = query.Limit(limit)
+		}
+		iter = query.Documents(ctx)
 	}
-	if limit > 0 {
-		query = query.Limit(limit)
-	}
-	
-	iter := query.Documents(ctx)
 	
 	var products []models.Product
 	for {
@@ -191,7 +201,7 @@ func (r *FirestoreRepository) ListProducts(ctx context.Context, tenantID string,
 
 	// When filtering by status we skipped OrderBy to avoid composite index,
 	// so sort in memory by created_at descending.
-	if hasStatusFilter {
+	if hasFilter {
 		sort.Slice(products, func(i, j int) bool {
 			return products[i].CreatedAt.After(products[j].CreatedAt)
 		})

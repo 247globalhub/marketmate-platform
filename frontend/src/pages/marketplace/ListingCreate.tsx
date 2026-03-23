@@ -21,7 +21,7 @@ const adapterColor: Record<string, string> = { amazon: '#FF9900', temu: '#FF6B35
 // to the generic step-3 title/price form.
 const DEDICATED_FORMS: Record<string, string> = {
   amazon:       '/marketplace/amazon/listings/create',
-  amazonnew:    '/marketplace/amazon/listings/create',
+  amazon:       '/marketplace/amazon/listings/create',
   ebay:         '/marketplace/ebay/listings/create',
   temu:         '/marketplace/temu/listings/create',
   temu_sandbox: '/marketplace/temu/listings/create',

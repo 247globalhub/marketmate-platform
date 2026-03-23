@@ -63,7 +63,6 @@ type AmazonMessagingWebhookHandler struct {
 	client             *firestore.Client
 	marketplaceService *services.MarketplaceService
 	messagingHandler   *MessagingHandler
-	notifier           *services.MessagingNotifier
 }
 
 func NewAmazonMessagingWebhookHandler(
@@ -75,12 +74,11 @@ func NewAmazonMessagingWebhookHandler(
 		client:             client,
 		marketplaceService: marketplaceService,
 		messagingHandler:   messagingHandler,
-		notifier:           services.NewMessagingNotifier(client),
 	}
 }
 
 // ============================================================================
-// REGISTRATION — called when an amazon/amazonnew credential is saved
+// REGISTRATION — called when an amazon credential is saved
 // ============================================================================
 
 // RegisterAmazonMessagingWebhook creates an APPLICATION destination in SP-API
@@ -154,30 +152,18 @@ func (h *AmazonMessagingWebhookHandler) RegisterAmazonMessagingWebhook(
 		log.Printf("[AmazonNotif] Created destination %s for credential %s", destID, cred.CredentialID)
 	}
 
-	// ── Step 2: Subscribe to notification types ─────────────────────────────
-	// We subscribe to multiple notification types using the same destination.
-	// Each type gets its own subscription_id stored in credential_data.
-	notifTypes := []struct {
-		notifType  string
-		storeKey   string
-	}{
-		{"MESSAGING_NEW_MESSAGE_NOTIFICATION", "amazon_notif_subscription_id"},
-		{"ORDER_CHANGE", "amazon_notif_order_change_sub_id"},
-	}
+	// ── Step 2: Subscribe to MESSAGING_NEW_MESSAGE_NOTIFICATION ──────────────
+	existingSubID := cred.CredentialData["amazon_notif_subscription_id"]
+	subID := existingSubID
 
-	for _, nt := range notifTypes {
-		existingSubID := cred.CredentialData[nt.storeKey]
-		if existingSubID != "" {
-			log.Printf("[AmazonNotif] Subscription %s already registered for %s", nt.notifType, cred.CredentialID)
-			continue
-		}
+	if subID == "" {
 		subPayload := map[string]interface{}{
 			"payloadVersion": "1.0",
 			"destinationId":  destID,
 		}
 		subBody, _ := json.Marshal(subPayload)
 		req, _ := http.NewRequestWithContext(ctx, "POST",
-			fmt.Sprintf("%s/notifications/v1/subscriptions/%s", endpoint, nt.notifType),
+			endpoint+"/notifications/v1/subscriptions/MESSAGING_NEW_MESSAGE_NOTIFICATION",
 			bytes.NewReader(subBody))
 		req.Header.Set("x-amz-access-token", accessToken)
 		req.Header.Set("Content-Type", "application/json")
@@ -185,32 +171,28 @@ func (h *AmazonMessagingWebhookHandler) RegisterAmazonMessagingWebhook(
 		client := &http.Client{Timeout: 20 * time.Second}
 		resp, err := client.Do(req)
 		if err != nil {
-			log.Printf("[AmazonNotif] WARNING: failed to subscribe to %s: %v", nt.notifType, err)
-			continue
+			return fmt.Errorf("create subscription: %w", err)
 		}
 		respBody, _ := io.ReadAll(resp.Body)
 		resp.Body.Close()
 
+		// 409 = subscription already exists — that's fine
 		if resp.StatusCode == 409 {
-			log.Printf("[AmazonNotif] Subscription %s already exists for %s", nt.notifType, cred.CredentialID)
-			cred.CredentialData[nt.storeKey] = "existing"
+			log.Printf("[AmazonNotif] Subscription already exists for %s", cred.CredentialID)
 		} else if resp.StatusCode != 200 && resp.StatusCode != 201 {
-			log.Printf("[AmazonNotif] WARNING: subscription %s returned %d: %s", nt.notifType, resp.StatusCode, string(respBody))
+			return fmt.Errorf("create subscription SP-API %d: %s", resp.StatusCode, string(respBody))
 		} else {
 			var subResult struct {
 				Payload struct {
 					SubscriptionID string `json:"subscriptionId"`
 				} `json:"payload"`
 			}
-			if err := json.Unmarshal(respBody, &subResult); err == nil && subResult.Payload.SubscriptionID != "" {
-				cred.CredentialData[nt.storeKey] = subResult.Payload.SubscriptionID
+			if err := json.Unmarshal(respBody, &subResult); err == nil {
+				subID = subResult.Payload.SubscriptionID
 			}
-			log.Printf("[AmazonNotif] Subscribed to %s, sub=%s", nt.notifType, cred.CredentialData[nt.storeKey])
+			log.Printf("[AmazonNotif] Subscribed to MESSAGING_NEW_MESSAGE_NOTIFICATION, sub=%s", subID)
 		}
 	}
-
-	// Keep subID for backwards compat field
-	subID := cred.CredentialData["amazon_notif_subscription_id"]
 
 	// ── Step 3: Persist IDs in credential_data ───────────────────────────────
 	if cred.CredentialData == nil {
@@ -393,30 +375,19 @@ func (h *AmazonMessagingWebhookHandler) handleSNSNotification(c *gin.Context, bo
 		NotificationType string `json:"NotificationType"`
 		EventTime        string `json:"EventTime"`
 		Payload          struct {
-			// MESSAGING_NEW_MESSAGE_NOTIFICATION
 			BuyerSellerMessagingNotification *struct {
 				AmazonOrderID string `json:"amazonOrderId"`
 				BuyerInfo     struct {
 					BuyerName string `json:"buyerName"`
 				} `json:"buyerInfo"`
 				Message struct {
-					MessageID     string `json:"messageId"`
-					Text          string `json:"text"`
-					SentDate      string `json:"sentDate"`
-					FromRole      string `json:"fromRole"` // "BUYER" or "SELLER"
+					MessageID   string `json:"messageId"`
+					Text        string `json:"text"`
+					SentDate    string `json:"sentDate"`
+					FromRole    string `json:"fromRole"` // "BUYER" or "SELLER"
 					MarketplaceID string `json:"marketplaceId"`
 				} `json:"message"`
 			} `json:"BuyerSellerMessagingNotification"`
-			// ORDER_CHANGE
-			OrderChangeNotification *struct {
-				AmazonOrderID   string `json:"amazonOrderId"`
-				OrderChangeType string `json:"orderChangeType"` // BUYER_REQUESTED_CANCEL, ORDER_STATUS_CHANGE etc
-				BuyerInfo       struct {
-					BuyerName string `json:"buyerName"`
-				} `json:"buyerInfo"`
-				OrderStatus string `json:"orderStatus"`
-				Summary     string `json:"summary,omitempty"`
-			} `json:"OrderChangeNotification"`
 		} `json:"payload"`
 		// SP-API wraps in sellerId for routing
 		SellerID string `json:"sellerId"`
@@ -429,33 +400,26 @@ func (h *AmazonMessagingWebhookHandler) handleSNSNotification(c *gin.Context, bo
 		return
 	}
 
-	ctx := c.Request.Context()
-
-	switch notif.NotificationType {
-	case "MESSAGING_NEW_MESSAGE_NOTIFICATION":
-		msgNotif := notif.Payload.BuyerSellerMessagingNotification
-		if msgNotif == nil {
-			break
-		}
-		log.Printf("[AmazonNotif] New message for order %s from %s (seller %s)",
-			msgNotif.AmazonOrderID, msgNotif.Message.FromRole, notif.SellerID)
-		if err := h.storeMessageNotification(ctx, notif.SellerID, msgNotif.Message.MarketplaceID, msgNotif); err != nil {
-			log.Printf("[AmazonNotif] Failed to store message: %v", err)
-		}
-
-	case "ORDER_CHANGE":
-		orderNotif := notif.Payload.OrderChangeNotification
-		if orderNotif == nil {
-			break
-		}
-		log.Printf("[AmazonNotif] ORDER_CHANGE for order %s type=%s (seller %s)",
-			orderNotif.AmazonOrderID, orderNotif.OrderChangeType, notif.SellerID)
-		if orderNotif.OrderChangeType == "BUYER_REQUESTED_CANCEL" {
-			h.handleAmazonCancelRequest(ctx, notif.SellerID, orderNotif)
-		}
-
-	default:
+	if notif.NotificationType != "MESSAGING_NEW_MESSAGE_NOTIFICATION" {
 		log.Printf("[AmazonNotif] Ignoring notification type: %s", notif.NotificationType)
+		c.JSON(http.StatusOK, gin.H{"ok": true})
+		return
+	}
+
+	msgNotif := notif.Payload.BuyerSellerMessagingNotification
+	if msgNotif == nil {
+		c.JSON(http.StatusOK, gin.H{"ok": true})
+		return
+	}
+
+	log.Printf("[AmazonNotif] New message for order %s from %s (seller %s)",
+		msgNotif.AmazonOrderID, msgNotif.Message.FromRole, notif.SellerID)
+
+	// Find the matching credential by seller_id across all tenants
+	ctx := c.Request.Context()
+	if err := h.storeMessageNotification(ctx, notif.SellerID, msgNotif.Message.MarketplaceID, msgNotif); err != nil {
+		log.Printf("[AmazonNotif] Failed to store message: %v", err)
+		// Still return 200 — storage failure shouldn't cause SNS retries
 	}
 
 	c.JSON(http.StatusOK, gin.H{"ok": true})
@@ -515,7 +479,7 @@ func (h *AmazonMessagingWebhookHandler) storeMessageNotification(
 			if err := credDoc.DataTo(&cred); err != nil {
 				continue
 			}
-			if cred.Channel != "amazon" && cred.Channel != "amazonnew" {
+			if cred.Channel != "amazon" {
 				continue
 			}
 
@@ -646,149 +610,6 @@ func (h *AmazonMessagingWebhookHandler) upsertConversationAndMessage(
 	return nil
 }
 
-
-// ============================================================================
-// AMAZON CANCEL REQUEST HANDLER
-// ============================================================================
-// Creates a messaging ticket and alerts staff when a buyer requests
-// cancellation of an Amazon order via ORDER_CHANGE notification.
-
-func (h *AmazonMessagingWebhookHandler) handleAmazonCancelRequest(
-	ctx context.Context,
-	sellerID string,
-	orderNotif *struct {
-		AmazonOrderID   string `json:"amazonOrderId"`
-		OrderChangeType string `json:"orderChangeType"`
-		BuyerInfo       struct {
-			BuyerName string `json:"buyerName"`
-		} `json:"buyerInfo"`
-		OrderStatus string `json:"orderStatus"`
-		Summary     string `json:"summary,omitempty"`
-	},
-) {
-	// Find tenant + credential by seller_id
-	tenantID, credID := h.findTenantBySellerID(ctx, sellerID)
-	if tenantID == "" {
-		log.Printf("[AmazonNotif] Cancel request: could not find tenant for seller %s order %s", sellerID, orderNotif.AmazonOrderID)
-		return
-	}
-
-	now := time.Now()
-	convID := fmt.Sprintf("amz_cancel_%s_%s", credID, orderNotif.AmazonOrderID)
-
-	subject := fmt.Sprintf("⚠️ Amazon Cancellation Request — Order %s", orderNotif.AmazonOrderID)
-	bodyText := fmt.Sprintf(
-		"A buyer has requested cancellation of an Amazon order.\n\n"+
-			"Order: %s\n"+
-			"Buyer: %s\n"+
-			"Order Status: %s\n\n"+
-			"⚠️ STOP — do not dispatch this order until resolved.\n"+
-			"If a label has already been printed, do not ship.\n"+
-			"Go to Messages to respond to the buyer.",
-		orderNotif.AmazonOrderID,
-		orderNotif.BuyerInfo.BuyerName,
-		orderNotif.OrderStatus,
-	)
-
-	// Upsert conversation
-	convRef := h.messagingHandler.convDoc(tenantID, convID)
-	existingSnap, _ := convRef.Get(ctx)
-
-	var conv models.Conversation
-	if existingSnap.Exists() {
-		existingSnap.DataTo(&conv)
-		convRef.Update(ctx, []firestore.Update{
-			{Path: "last_message_at", Value: now},
-			{Path: "last_message_preview", Value: bodyText[:min(100, len(bodyText))]},
-			{Path: "unread", Value: true},
-			{Path: "status", Value: models.ConvStatusOpen},
-			{Path: "updated_at", Value: now},
-		})
-	} else {
-		conv = models.Conversation{
-			ConversationID:      convID,
-			TenantID:            tenantID,
-			Channel:             "amazon",
-			ChannelAccountID:    credID,
-			MarketplaceThreadID: orderNotif.AmazonOrderID,
-			OrderNumber:         orderNotif.AmazonOrderID,
-			Customer:            models.ConversationCustomer{Name: orderNotif.BuyerInfo.BuyerName},
-			Subject:             subject,
-			Status:              models.ConvStatusOpen,
-			LastMessageAt:       now,
-			LastMessagePreview:  bodyText[:min(100, len(bodyText))],
-			Unread:              true,
-			MessageCount:        1,
-			CreatedAt:           now,
-			UpdatedAt:           now,
-		}
-		convRef.Set(ctx, conv)
-	}
-
-	// Store alert message
-	msgID := fmt.Sprintf("amz_cancel_%d", now.UnixNano())
-	h.messagingHandler.msgCol(tenantID, convID).Doc(msgID).Set(ctx, models.Message{
-		MessageID:      msgID,
-		ConversationID: convID,
-		Direction:      models.MsgDirectionInbound,
-		Body:           bodyText,
-		SentBy:         "amazon_platform",
-		SentAt:         now,
-	})
-
-	log.Printf("[AmazonNotif] Cancel ticket created: conv=%s tenant=%s order=%s",
-		convID, tenantID, orderNotif.AmazonOrderID)
-
-	// Alert all team members
-	if h.notifier != nil {
-		members, err := h.notifier.GetAssignableMembers(ctx, tenantID)
-		if err == nil {
-			for _, m := range members {
-				member := m
-				go h.notifier.NotifyAssignment(context.Background(), &member, &conv, "Amazon Platform")
-			}
-		}
-	}
-}
-
-// findTenantBySellerID scans all active amazon/amazonnew credentials to find
-// the tenant matching the given seller_id.
-func (h *AmazonMessagingWebhookHandler) findTenantBySellerID(ctx context.Context, sellerID string) (tenantID, credID string) {
-	tenantIter := h.client.Collection("tenants").Documents(ctx)
-	defer tenantIter.Stop()
-	for {
-		tenantDoc, err := tenantIter.Next()
-		if err != nil {
-			break
-		}
-		tid := tenantDoc.Ref.ID
-		credIter := h.client.Collection("tenants").Doc(tid).
-			Collection("marketplace_credentials").
-			Where("active", "==", true).
-			Documents(ctx)
-		for {
-			credDoc, err := credIter.Next()
-			if err != nil {
-				break
-			}
-			var cred models.MarketplaceCredential
-			if err := credDoc.DataTo(&cred); err != nil {
-				continue
-			}
-			if cred.Channel != "amazon" && cred.Channel != "amazonnew" {
-				continue
-			}
-			if cred.CredentialData["seller_id"] == sellerID {
-				credIter.Stop()
-				return tid, cred.CredentialID
-			}
-		}
-		credIter.Stop()
-	}
-	return "", ""
-}
-
-
 // ============================================================================
 // SNS SIGNATURE VERIFICATION
 // ============================================================================
@@ -868,7 +689,7 @@ func (h *AmazonMessagingWebhookHandler) TryRegisterAmazonMessagingWebhook(
 		log.Printf("[AmazonNotif] BACKEND_URL not set — skipping webhook registration for %s", cred.CredentialID)
 		return
 	}
-	if cred.Channel != "amazon" && cred.Channel != "amazonnew" {
+	if cred.Channel != "amazon" {
 		return
 	}
 
@@ -884,7 +705,7 @@ func (h *AmazonMessagingWebhookHandler) TryRegisterAmazonMessagingWebhook(
 }
 
 // RegisterAllExistingCredentials registers webhooks for all existing
-// amazon/amazonnew credentials that don't already have a destination_id.
+// amazon credentials that don't already have a destination_id.
 // Called once at startup.
 func (h *AmazonMessagingWebhookHandler) RegisterAllExistingCredentials(
 	ctx context.Context,
@@ -930,7 +751,7 @@ func (h *AmazonMessagingWebhookHandler) RegisterAllExistingCredentials(
 			if err := credDoc.DataTo(&cred); err != nil {
 				continue
 			}
-			if cred.Channel != "amazon" && cred.Channel != "amazonnew" {
+			if cred.Channel != "amazon" {
 				continue
 			}
 			// Already registered

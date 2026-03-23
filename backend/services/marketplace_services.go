@@ -354,10 +354,10 @@ func (s *ImportService) StartImportJob(ctx context.Context, tenantID string, req
 		return nil, err
 	}
 
-	// Amazon (both 'amazon' and 'amazonnew') use Cloud Functions orchestrator
+	// Amazon uses Cloud Functions orchestrator
 	// which handles the long-running SP-API report flow outside Cloud Run constraints.
 	// All other channels use the local worker (direct API calls).
-	if job.Channel == "amazon" || job.Channel == "amazonnew" {
+	if job.Channel == "amazon" {
 		go s.triggerOrchestrator(job)
 	} else {
 		go func() {

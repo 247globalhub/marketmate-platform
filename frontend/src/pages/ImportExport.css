@@ -870,3 +870,84 @@
   text-decoration: underline;
 }
 .ie-link-btn.ie-link-danger { color: #dc2626; }
+
+/* ── Export Jobs Queue ────────────────────────────────────────────────────── */
+.ie-jobs-section {
+  margin-top: 24px;
+  border: 1px solid var(--border, #2a2a3a);
+  border-radius: 8px;
+  overflow: hidden;
+}
+.ie-jobs-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 10px 16px;
+  background: var(--surface2, #1a1a2a);
+  border-bottom: 1px solid var(--border, #2a2a3a);
+}
+.ie-jobs-title {
+  font-size: 12px;
+  font-weight: 700;
+  color: var(--text-primary, #e0e0e0);
+  letter-spacing: 0.03em;
+}
+.ie-btn-sm {
+  padding: 4px 10px !important;
+  font-size: 11px !important;
+}
+.ie-jobs-empty {
+  padding: 20px 16px;
+  font-size: 12px;
+  color: var(--text-muted, #888);
+  text-align: center;
+}
+.ie-jobs-table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 12px;
+}
+.ie-jobs-table thead tr {
+  background: var(--surface2, #1a1a2a);
+}
+.ie-jobs-table th {
+  padding: 8px 12px;
+  text-align: left;
+  font-size: 10px;
+  font-weight: 700;
+  color: var(--text-muted, #888);
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  border-bottom: 1px solid var(--border, #2a2a3a);
+}
+.ie-jobs-table td {
+  padding: 10px 12px;
+  border-bottom: 1px solid var(--border, #1e1e2e);
+  vertical-align: middle;
+  color: var(--text-primary, #e0e0e0);
+}
+.ie-jobs-table tr:last-child td { border-bottom: none; }
+.ie-job-badge {
+  display: inline-block;
+  padding: 2px 8px;
+  border-radius: 99px;
+  font-size: 10px;
+  font-weight: 700;
+}
+.ie-job-ready    { background: #d4edda22; color: #4caf50; border: 1px solid #4caf5040; }
+.ie-job-building { background: #fff3cd22; color: #f59e0b; border: 1px solid #f59e0b40; }
+.ie-job-queued   { background: #cce5ff22; color: #60a5fa; border: 1px solid #60a5fa40; }
+.ie-job-failed   { background: #f8d7da22; color: #ef4444; border: 1px solid #ef444440; }
+.ie-job-error    { font-size: 10px; color: #ef4444; margin-top: 3px; }
+.ie-download-link {
+  display: inline-block;
+  padding: 4px 12px;
+  background: var(--primary, #06b6d4);
+  color: #000;
+  font-weight: 700;
+  font-size: 11px;
+  border-radius: 6px;
+  text-decoration: none;
+  transition: opacity 0.15s;
+}
+.ie-download-link:hover { opacity: 0.85; }

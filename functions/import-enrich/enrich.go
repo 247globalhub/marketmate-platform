@@ -207,25 +207,18 @@ func processEnrichBatch(ctx context.Context, payload EnrichPayload) error {
 			continue
 		}
 
-		// Mirror images to GCS synchronously and replace Amazon CDN URLs with
-		// GCS URLs in the normalized map before writing to Firestore.
-		// This ensures the product document always contains GCS URLs.
+		// Mirror images to GCS asynchronously — fire and forget so it doesn't
+		// block the enrich loop or push tasks past Cloud Run timeout.
+		// Amazon CDN URLs remain in the document until the next re-enrichment.
 		if imgs, ok := normalized["images"].([]map[string]interface{}); ok && len(imgs) > 0 {
-			for i, img := range imgs {
-				if srcURL, _ := img["url"].(string); srcURL != "" {
-					gcsURL := mirrorImageToGCS(ctx, payload.TenantID, item.ProductID, srcURL)
-					if gcsURL != srcURL {
-						// Replace Amazon URL with GCS URL in the map
-						imgCopy := make(map[string]interface{})
-						for k, v := range img {
-							imgCopy[k] = v
-						}
-						imgCopy["url"] = gcsURL
-						imgs[i] = imgCopy
+			go func(tenantID, productID string, imgs []map[string]interface{}) {
+				bgCtx := context.Background()
+				for _, img := range imgs {
+					if srcURL, _ := img["url"].(string); srcURL != "" {
+						mirrorImageToGCS(bgCtx, tenantID, productID, srcURL)
 					}
 				}
-			}
-			normalized["images"] = imgs
+			}(payload.TenantID, item.ProductID, imgs)
 		}
 
 		bulletCount := 0
@@ -258,7 +251,8 @@ func processEnrichBatch(ctx context.Context, payload EnrichPayload) error {
 		// for child products. Extract the parent ASIN and link the product doc
 		// to its parent product, marking it as product_type="variation".
 		if parentASIN := extractParentASIN(catalog2022, item.ASIN); parentASIN != "" {
-			linkVariationToParent(ctx, fsClient, payload.TenantID, item.ProductID, item.ASIN, parentASIN)
+			childTitle, _ := normalized["title"].(string)
+			linkVariationToParent(ctx, fsClient, payload.TenantID, item.ProductID, item.ASIN, parentASIN, spapiCreds, accessToken, childTitle)
 		}
 
 		enriched++
@@ -1127,14 +1121,28 @@ func updateProductWithEnrichedData(ctx context.Context, client *firestore.Client
 		if b, ok := n["bullets"].([]string); ok && len(b) > 0 {
 			updates = append(updates, firestore.Update{Path: "attributes.bullet_points", Value: b})
 		}
-		// Additional attributes for basic details
-		attrMap := map[string]string{
-			"manufacturer": "manufacturer", "model_number": "model_number", "part_number": "part_number",
-			"color": "color", "size": "size", "style": "style", "product_type": "amazon_product_type",
-		}
-		for nk, ak := range attrMap {
-			if v, ok := n[nk].(string); ok && v != "" {
-				updates = append(updates, firestore.Update{Path: "attributes." + ak, Value: v})
+		// Write ALL flattened SP-API attributes to product.attributes.*
+		// This populates the export with the full attribute set per Amazon product type
+		if af, ok := n["attributes_flat"].(map[string]interface{}); ok && len(af) > 0 {
+			for k, v := range af {
+				// Skip internal/source fields that don't belong in product attributes
+				switch k {
+				case "sku", "fulfillment_channel", "source_sku", "source_price",
+					"source_currency", "source_marketplace", "bullet_points":
+					continue
+				}
+				updates = append(updates, firestore.Update{Path: "attributes." + k, Value: v})
+			}
+		} else {
+			// Fallback: write the basic fields if attributes_flat not available
+			attrMap := map[string]string{
+				"manufacturer": "manufacturer", "model_number": "model_number", "part_number": "part_number",
+				"color": "color", "size": "size", "style": "style", "product_type": "amazon_product_type",
+			}
+			for nk, ak := range attrMap {
+				if v, ok := n[nk].(string); ok && v != "" {
+					updates = append(updates, firestore.Update{Path: "attributes." + ak, Value: v})
+				}
 			}
 		}
 	} else {
@@ -1183,6 +1191,23 @@ func updateProductWithEnrichedData(ctx context.Context, client *firestore.Client
 			}
 			if _, hasBullets := attrs["bullet_points"]; !hasBullets {
 				updates = append(updates, firestore.Update{Path: "attributes.bullet_points", Value: b})
+			}
+		}
+		// On subsequent enrichment, fill any missing attributes from attributes_flat
+		if af, ok := n["attributes_flat"].(map[string]interface{}); ok && len(af) > 0 {
+			existingAttrs, _ := existing["attributes"].(map[string]interface{})
+			if existingAttrs == nil {
+				existingAttrs = map[string]interface{}{}
+			}
+			for k, v := range af {
+				switch k {
+				case "sku", "fulfillment_channel", "source_sku", "source_price",
+					"source_currency", "source_marketplace", "bullet_points":
+					continue
+				}
+				if _, exists := existingAttrs[k]; !exists {
+					updates = append(updates, firestore.Update{Path: "attributes." + k, Value: v})
+				}
 			}
 		}
 	}
@@ -1599,12 +1624,12 @@ func extractParentASIN(raw2022 map[string]interface{}, currentASIN string) strin
 //   - product_type = "variation"
 //   - attributes.parent_asin = parentASIN
 //   - parent_id = parentProductID (the Firestore product_id of the parent)
-func linkVariationToParent(ctx context.Context, client *firestore.Client, tenantID, childProductID, childASIN, parentASIN string) {
+func linkVariationToParent(ctx context.Context, client *firestore.Client, tenantID, childProductID, childASIN, parentASIN string, creds SPAPICreds, accessToken, childTitle string) {
 	// Find the parent's product_id via import_mappings
 	parentProductID := ""
 	iter := client.Collection("tenants").Doc(tenantID).
 		Collection("import_mappings").
-		Where("channel", "==", "amazon").
+		Where("channel", "in", []interface{}{"amazon"}).
 		Where("external_id", "==", parentASIN).
 		Limit(1).
 		Documents(ctx)
@@ -1616,14 +1641,29 @@ func linkVariationToParent(ctx context.Context, client *firestore.Client, tenant
 	}
 
 	if parentProductID == "" {
-		// Parent not yet imported — create a stub parent product so the link exists
+		// Parent not yet imported — fetch its title from the API then create the product
 		parentProductID = uuid.New().String()
+		parentTitle := ""
+		if creds.RefreshToken != "" && accessToken != "" {
+			if parentCatalog, _, err := getCatalog2022(creds, accessToken, parentASIN); err == nil && parentCatalog != nil {
+				if pn := normalizeProduct(parentASIN, parentCatalog); pn != nil {
+					parentTitle, _ = pn["title"].(string)
+				}
+			}
+		}
+		// Fall back to deriving a title from the child title if API call failed
+		if parentTitle == "" && childTitle != "" {
+			parentTitle = childTitle
+		} else if parentTitle == "" {
+			parentTitle = fmt.Sprintf("Parent product (%s)", parentASIN)
+		}
 		parentProduct := map[string]interface{}{
 			"product_id":   parentProductID,
 			"tenant_id":    tenantID,
-			"title":        fmt.Sprintf("Parent product (%s)", parentASIN),
+			"title":        parentTitle,
 			"status":       "active",
 			"product_type": "variable",
+			"asin":         parentASIN,
 			"attributes":   map[string]interface{}{"parent_asin": parentASIN},
 			"identifiers":  map[string]interface{}{"asin": parentASIN},
 			"assets":       []interface{}{},
@@ -1653,27 +1693,69 @@ func linkVariationToParent(ctx context.Context, client *firestore.Client, tenant
 		log.Printf("[Enrich] Created stub parent product %s for parent ASIN %s (child ASIN %s)", parentProductID, parentASIN, childASIN)
 	}
 
+	// Fetch the parent's SKU so we can write parent_sku to the child
+	// parent_sku is what the export uses to link children to parents
+	parentSKU := ""
+	parentDoc, err := client.Collection("tenants").Doc(tenantID).
+		Collection("products").Doc(parentProductID).Get(ctx)
+	if err == nil {
+		parentSKU, _ = parentDoc.Data()["sku"].(string)
+		if parentSKU == "" {
+			// Try identifiers.asin as fallback SKU
+			if ids, ok := parentDoc.Data()["identifiers"].(map[string]interface{}); ok {
+				parentSKU, _ = ids["asin"].(string)
+			}
+		}
+	}
+
 	// Update the child product
 	childRef := client.Collection("tenants").Doc(tenantID).
 		Collection("products").Doc(childProductID)
-	_, err = childRef.Update(ctx, []firestore.Update{
+	childUpdates := []firestore.Update{
 		{Path: "product_type", Value: "variation"},
 		{Path: "parent_id", Value: parentProductID},
 		{Path: "attributes.parent_asin", Value: parentASIN},
 		{Path: "updated_at", Value: time.Now()},
-	})
+	}
+	if parentSKU != "" {
+		childUpdates = append(childUpdates, firestore.Update{Path: "parent_sku", Value: parentSKU})
+	}
+	_, err = childRef.Update(ctx, childUpdates)
 	if err != nil {
 		log.Printf("[Enrich] WARN: could not link child product %s to parent %s: %v", childProductID, parentProductID, err)
 		return
 	}
 
-	// Also update the parent to be product_type="variable" if it isn't already
+	// Update the parent — ensure product_type=variable and fix placeholder title
+	parentUpdates := []firestore.Update{
+		{Path: "product_type", Value: "variable"},
+		{Path: "updated_at", Value: time.Now()},
+	}
+	// If parent has a placeholder title and we have the child title, use it as fallback
+	if existingParentDoc, err2 := client.Collection("tenants").Doc(tenantID).
+		Collection("products").Doc(parentProductID).Get(ctx); err2 == nil {
+		existingTitle, _ := existingParentDoc.Data()["title"].(string)
+		if (existingTitle == "" || strings.HasPrefix(existingTitle, "Parent product (")) {
+			// Try fetching the real parent title from the API
+			realTitle := ""
+			if creds.RefreshToken != "" && accessToken != "" {
+				if parentCatalog, _, err3 := getCatalog2022(creds, accessToken, parentASIN); err3 == nil && parentCatalog != nil {
+					if pn := normalizeProduct(parentASIN, parentCatalog); pn != nil {
+						realTitle, _ = pn["title"].(string)
+					}
+				}
+			}
+			if realTitle == "" && childTitle != "" {
+				realTitle = childTitle
+			}
+			if realTitle != "" {
+				parentUpdates = append(parentUpdates, firestore.Update{Path: "title", Value: realTitle})
+			}
+		}
+	}
 	client.Collection("tenants").Doc(tenantID).
 		Collection("products").Doc(parentProductID).
-		Update(ctx, []firestore.Update{
-			{Path: "product_type", Value: "variable"},
-			{Path: "updated_at", Value: time.Now()},
-		})
+		Update(ctx, parentUpdates)
 
 	log.Printf("[Enrich] Linked child %s (ASIN %s) → parent %s (ASIN %s)", childProductID, childASIN, parentProductID, parentASIN)
 }

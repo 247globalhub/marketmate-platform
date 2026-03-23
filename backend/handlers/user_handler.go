@@ -1,7 +1,14 @@
 package handlers
 
 import (
+	"crypto/rand"
+	"fmt"
+	"io"
+	"log"
+	"math/big"
 	"net/http"
+	"net/url"
+	"os"
 	"strings"
 	"time"
 
@@ -23,6 +30,77 @@ type UserHandler struct {
 
 func NewUserHandler(client *firestore.Client) *UserHandler {
 	return &UserHandler{client: client}
+}
+
+// ── Twilio helpers ─────────────────────────────────────────────────────────────
+// Uses direct Twilio Messages API (existing credentials) rather than Twilio Verify.
+// OTP codes are generated here and stored in Firestore with a 10-minute expiry.
+
+func generateOTP() string {
+	n, err := rand.Int(rand.Reader, big.NewInt(900000))
+	if err != nil {
+		return "123456" // fallback (very unlikely)
+	}
+	return fmt.Sprintf("%06d", n.Int64()+100000)
+}
+
+// sendTwilioOTP sends a 6-digit OTP via SMS or WhatsApp using existing Twilio credentials.
+// channel must be "sms" or "whatsapp".
+// Returns the OTP code so the caller can store it for verification.
+func sendTwilioOTP(toPhone, channel, code string) error {
+	sid   := os.Getenv("TWILIO_ACCOUNT_SID")
+	token := os.Getenv("TWILIO_AUTH_TOKEN")
+	if sid == "" || token == "" {
+		return fmt.Errorf("Twilio not configured (TWILIO_ACCOUNT_SID / TWILIO_AUTH_TOKEN)")
+	}
+
+	// Use TWILIO_SMS_FROM for SMS if set, otherwise strip whatsapp: prefix from TWILIO_FROM
+	to   := toPhone
+	from := os.Getenv("TWILIO_FROM")
+	if channel == "whatsapp" {
+		// Ensure both have whatsapp: prefix for WhatsApp channel
+		if !strings.HasPrefix(to, "whatsapp:") {
+			to = "whatsapp:" + to
+		}
+		if !strings.HasPrefix(from, "whatsapp:") {
+			from = "whatsapp:" + from
+		}
+	} else {
+		// SMS — use TWILIO_SMS_FROM if set, otherwise strip whatsapp: prefix
+		smsFrom := os.Getenv("TWILIO_SMS_FROM")
+		if smsFrom != "" {
+			from = smsFrom
+		} else {
+			// Strip whatsapp: prefix if present
+			from = strings.TrimPrefix(from, "whatsapp:")
+		}
+		if from == "" {
+			return fmt.Errorf("no SMS-capable number configured (set TWILIO_SMS_FROM)")
+		}
+	}
+
+	body := fmt.Sprintf("Your MarketMate verification code is: %s\nThis code expires in 10 minutes.", code)
+
+	params := url.Values{}
+	params.Set("To", to)
+	params.Set("From", from)
+	params.Set("Body", body)
+
+	twiURL := fmt.Sprintf("https://api.twilio.com/2010-04-01/Accounts/%s/Messages.json", sid)
+	req, _ := http.NewRequest("POST", twiURL, strings.NewReader(params.Encode()))
+	req.SetBasicAuth(sid, token)
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return fmt.Errorf("twilio request failed: %w", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode >= 300 {
+		body, _ := io.ReadAll(resp.Body)
+		return fmt.Errorf("twilio error %d: %s", resp.StatusCode, string(body))
+	}
+	return nil
 }
 
 // ============================================================================
@@ -479,6 +557,173 @@ func (h *UserHandler) PutProfile(c *gin.Context) {
 	}
 
 	c.JSON(http.StatusOK, gin.H{"message": "profile updated"})
+}
+
+
+// ============================================================================
+// PHONE VERIFICATION
+// POST /api/v1/user/phone/send-otp
+// POST /api/v1/user/phone/verify-otp
+// ============================================================================
+
+// SendPhoneOTP sends a Twilio Verify OTP to the supplied phone number.
+func (h *UserHandler) SendPhoneOTP(c *gin.Context) {
+	userID := c.GetString("user_id")
+	if userID == "" {
+		c.JSON(http.StatusUnauthorized, gin.H{"error": "not authenticated"})
+		return
+	}
+	var req struct {
+		Phone   string `json:"phone"   binding:"required"`
+		Channel string `json:"channel"` // "sms" | "whatsapp"
+	}
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+	if req.Channel == "" {
+		req.Channel = "sms"
+	}
+	// Save phone + channel to profile (unverified) so we know what to verify
+	_, err := h.client.Collection("global_users").Doc(userID).Update(c.Request.Context(), []firestore.Update{
+		{Path: "phone", Value: req.Phone},
+		{Path: "phone_channel", Value: req.Channel},
+		{Path: "phone_verified", Value: false},
+		{Path: "updated_at", Value: time.Now().UTC()},
+	})
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to save phone"})
+		return
+	}
+	// Generate OTP and store in Firestore with 10-min expiry
+	code := generateOTP()
+	_, err = h.client.Collection("global_users").Doc(userID).Update(c.Request.Context(), []firestore.Update{
+		{Path: "phone_otp", Value: code},
+		{Path: "phone_otp_expires", Value: time.Now().UTC().Add(10 * time.Minute)},
+	})
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to store OTP"})
+		return
+	}
+	if err := sendTwilioOTP(req.Phone, req.Channel, code); err != nil {
+		log.Printf("[Profile] Twilio OTP failed for user %s: %v", userID, err)
+		c.JSON(http.StatusBadGateway, gin.H{"error": "failed to send verification code: " + err.Error()})
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{"ok": true, "message": "Verification code sent"})
+}
+
+// VerifyPhoneOTP checks the OTP and marks the phone as verified on success.
+func (h *UserHandler) VerifyPhoneOTP(c *gin.Context) {
+	userID := c.GetString("user_id")
+	if userID == "" {
+		c.JSON(http.StatusUnauthorized, gin.H{"error": "not authenticated"})
+		return
+	}
+	var req struct {
+		Phone string `json:"phone"   binding:"required"`
+		Code  string `json:"code"    binding:"required"`
+	}
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+	// Check OTP against Firestore
+	ctx := c.Request.Context()
+	snap, err := h.client.Collection("global_users").Doc(userID).Get(ctx)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to load profile"})
+		return
+	}
+	storedCode, _ := snap.Data()["phone_otp"].(string)
+	var otpExpires time.Time
+	if t, ok := snap.Data()["phone_otp_expires"].(time.Time); ok {
+		otpExpires = t
+	}
+	if storedCode == "" {
+		c.JSON(http.StatusUnprocessableEntity, gin.H{"error": "No verification code found — please request a new one"})
+		return
+	}
+	if time.Now().UTC().After(otpExpires) {
+		c.JSON(http.StatusUnprocessableEntity, gin.H{"error": "Verification code has expired — please request a new one"})
+		return
+	}
+	if req.Code != storedCode {
+		c.JSON(http.StatusUnprocessableEntity, gin.H{"error": "Incorrect code — please try again"})
+		return
+	}
+	// Mark verified and clear OTP
+	_, err = h.client.Collection("global_users").Doc(userID).Update(ctx, []firestore.Update{
+		{Path: "phone_verified", Value: true},
+		{Path: "phone_otp", Value: firestore.Delete},
+		{Path: "phone_otp_expires", Value: firestore.Delete},
+		{Path: "updated_at", Value: time.Now().UTC()},
+	})
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to mark phone verified"})
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{"ok": true, "message": "Phone number verified successfully"})
+}
+
+// UpdateNotifPrefs saves notification preferences for the user.
+// PUT /api/v1/user/notif-prefs
+// Writes to global_users (for profile display) AND user_memberships (for messaging notifier).
+func (h *UserHandler) UpdateNotifPrefs(c *gin.Context) {
+	userID   := c.GetString("user_id")
+	tenantID := c.GetString("tenant_id")
+	if userID == "" {
+		c.JSON(http.StatusUnauthorized, gin.H{"error": "not authenticated"})
+		return
+	}
+	var req struct {
+		Email    bool   `json:"email"`
+		SMS      bool   `json:"sms"`
+		WhatsApp bool   `json:"whatsapp"`
+		Phone    string `json:"phone"`   // phone to use for SMS/WhatsApp alerts
+		EmailAddr string `json:"email_address"` // override email for alerts
+	}
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+	ctx := c.Request.Context()
+
+	// 1. Update GlobalUser notif_prefs
+	_, err := h.client.Collection("global_users").Doc(userID).Update(ctx, []firestore.Update{
+		{Path: "notif_prefs.email", Value: req.Email},
+		{Path: "notif_prefs.sms", Value: req.SMS},
+		{Path: "notif_prefs.whatsapp", Value: req.WhatsApp},
+		{Path: "updated_at", Value: time.Now().UTC()},
+	})
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to save notification preferences"})
+		return
+	}
+
+	// 2. Update UserMembership.MessagingNotifPrefs so the messaging notifier picks it up
+	if tenantID != "" {
+		channels := []string{}
+		if req.Email    { channels = append(channels, "email") }
+		if req.SMS      { channels = append(channels, "sms") }
+		if req.WhatsApp { channels = append(channels, "whatsapp") }
+
+		// Find the membership doc for this user+tenant
+		iter := h.client.Collection("user_memberships").
+			Where("user_id", "==", userID).
+			Where("tenant_id", "==", tenantID).
+			Limit(1).Documents(ctx)
+		if doc, err2 := iter.Next(); err2 == nil {
+			doc.Ref.Update(ctx, []firestore.Update{
+				{Path: "messaging_notif_prefs.channels", Value: channels},
+				{Path: "messaging_notif_prefs.phone", Value: req.Phone},
+				{Path: "messaging_notif_prefs.email", Value: req.EmailAddr},
+				{Path: "updated_at", Value: time.Now().UTC()},
+			})
+		}
+	}
+
+	c.JSON(http.StatusOK, gin.H{"ok": true})
 }
 
 // ============================================================================

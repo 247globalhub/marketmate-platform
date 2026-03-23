@@ -123,35 +123,56 @@ function ExportPanel() {
   const selected = EXPORT_TYPES.find(t => t.value === selectedType);
   const isSimple = selected?.simple === true;
 
+  const [jobs, setJobs] = useState<any[]>([]);
+  const [loadingJobs, setLoadingJobs] = useState(false);
+
+  const loadJobs = async () => {
+    setLoadingJobs(true);
+    try {
+      const res = await api('/export/jobs');
+      const data = await res.json();
+      setJobs(data.jobs || []);
+    } catch {} finally {
+      setLoadingJobs(false);
+    }
+  };
+
+  useEffect(() => { loadJobs(); }, []);
+
   const doExport = async () => {
     setExporting(true);
     setError('');
     try {
       let res: Response;
       if (isSimple) {
-        // Simple GET exports (RMA, PO, Shipments)
+        // Simple GET exports (RMA, PO, Shipments) — small files, direct download
         res = await api(`/export/${selectedType === 'purchase_orders' ? 'purchase-orders' : selectedType}`);
-      } else {
-        res = await api('/export', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ type: selectedType, format, include_variants: true, include_bundles: true }),
-        });
-      }
-      if (!res.ok) {
-        const j = await res.json().catch(() => ({}));
-        throw new Error((j as any).error || `Export failed (${res.status})`);
-      }
-      const contentType = res.headers.get('content-type') || '';
-      if (contentType.includes('application/json')) {
-        const data: any = await res.json();
-        downloadAsCSV(data.headers, data.rows, data.filename.replace('.xlsx', '.csv'));
-      } else {
+        if (!res.ok) {
+          const j = await res.json().catch(() => ({}));
+          throw new Error((j as any).error || `Export failed (${res.status})`);
+        }
         const blob = await res.blob();
         const cd = res.headers.get('content-disposition') || '';
         const fnMatch = cd.match(/filename=([^;]+)/);
-        const fn = fnMatch ? fnMatch[1].trim() : `export_${selectedType}.csv`;
-        triggerDownload(blob, fn);
+        triggerDownload(blob, fnMatch ? fnMatch[1].trim() : `export_${selectedType}.csv`);
+      } else {
+        // Large exports — queue as background job
+        res = await api('/export/queue', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ type: selectedType, format }),
+        });
+        if (!res.ok) {
+          const j = await res.json().catch(() => ({}));
+          throw new Error((j as any).error || `Export failed (${res.status})`);
+        }
+        // Reload jobs list so new job appears immediately
+        await loadJobs();
+        // Poll every 5 seconds until job is ready
+        const poll = setInterval(async () => {
+          await loadJobs();
+        }, 5000);
+        setTimeout(() => clearInterval(poll), 5 * 60 * 1000); // stop after 5 min
       }
     } catch (e: any) {
       setError(e.message);
@@ -174,9 +195,9 @@ function ExportPanel() {
         ))}
       </div>
 
-      {!isSimple && (
-        <div className="ie-export-options">
-          <div className="ie-section-title">Options</div>
+      {/* Options + Export button in same block */}
+      <div className="ie-export-options">
+        {!isSimple && (
           <div className="ie-format-row">
             <span className="ie-label">File format</span>
             <div className="ie-format-btns">
@@ -184,18 +205,53 @@ function ExportPanel() {
               <button className={`ie-fmt-btn ${format === 'xlsx' ? 'active' : ''}`} onClick={() => setFormat('xlsx')}>XLSX (Excel)</button>
             </div>
           </div>
+        )}
+        {error && <div className="ie-error-banner">⚠️ {error}</div>}
+        <div className="ie-export-action">
+          <button className="ie-btn-primary" onClick={doExport} disabled={exporting}>
+            {exporting
+              ? <><span className="ie-spinner" /> Queuing…</>
+              : <>{selected?.icon} {isSimple ? 'Export' : 'Queue Export'} {selected?.label}{!isSimple ? ` as ${format.toUpperCase()}` : ''}</>}
+          </button>
+        </div>
+      </div>
+
+      {/* Export Jobs Queue — full width below everything */}
+      {!isSimple && (
+        <div className="ie-jobs-section">
+          <div className="ie-jobs-header">
+            <span className="ie-jobs-title">📋 Export Queue</span>
+            <button className="ie-btn-ghost ie-btn-sm" onClick={loadJobs} disabled={loadingJobs}>↻ Refresh</button>
+          </div>
+          {jobs.length === 0 ? (
+            <div className="ie-jobs-empty">No exports yet. Click "Queue Export" above — the file is built in the background and will appear here when ready to download.</div>
+          ) : (
+            <table className="ie-jobs-table">
+              <thead><tr><th>Type</th><th>Format</th><th>Rows</th><th>Status</th><th>Queued At</th><th>Download</th></tr></thead>
+              <tbody>
+                {jobs.map(job => (
+                  <tr key={job.job_id}>
+                    <td style={{textTransform:'capitalize'}}>{job.type?.replace(/_/g,' ')}</td>
+                    <td>{(job.format || 'csv').toUpperCase()}</td>
+                    <td>{job.row_count ? job.row_count.toLocaleString() : '—'}</td>
+                    <td>
+                      <span className={`ie-job-badge ie-job-${job.status}`}>
+                        {job.status === 'ready' ? '✅ Ready' : job.status === 'building' ? '⏳ Building…' : job.status === 'queued' ? '🕐 Queued' : job.status === 'failed' ? '❌ Failed' : job.status}
+                      </span>
+                      {job.error && <div className="ie-job-error">{job.error}</div>}
+                    </td>
+                    <td style={{fontSize:'11px',color:'#888'}}>{job.created_at ? new Date(job.created_at).toLocaleString() : ''}</td>
+                    <td>{job.status === 'ready' && job.download_url
+                      ? <a href={job.download_url} download className="ie-download-link">⬇ Download</a>
+                      : <span style={{color:'#888'}}>—</span>}
+                    </td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          )}
         </div>
       )}
-
-      {error && <div className="ie-error-banner">⚠️ {error}</div>}
-
-      <div className="ie-export-action">
-        <button className="ie-btn-primary" onClick={doExport} disabled={exporting}>
-          {exporting
-            ? <><span className="ie-spinner" /> Exporting…</>
-            : <>{selected?.icon} Export {selected?.label}{isSimple ? '' : ` as ${format.toUpperCase()}`}</>}
-        </button>
-      </div>
     </div>
   );
 }

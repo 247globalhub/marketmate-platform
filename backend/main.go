@@ -32,18 +32,6 @@ func init() {
 		IsActive:         true,
 	})
 
-	marketplace.Register("amazonnew", adapters.NewAmazonAdapter, marketplace.AdapterMetadata{
-		ID:               "amazonnew",
-		Name:             "amazonnew",
-		DisplayName:      "Amazon (New)",
-		Icon:             "ri-amazon-fill",
-		Color:            "text-orange-500",
-		RequiresOAuth:    true,
-		SupportedRegions: []string{"US", "UK", "CA", "DE", "FR", "IT", "ES", "JP"},
-		Features:         []string{"import", "listing", "fba", "variations"},
-		IsActive:         true,
-	})
-
 	marketplace.Register("temu", adapters.NewTemuAdapter, marketplace.AdapterMetadata{
 		ID:            "temu",
 		Name:          "temu",
@@ -517,6 +505,10 @@ func main() {
 	exportService := services.NewExportService(firestoreRepo)
 	exportHandler := handlers.NewExportHandler(exportService, firestoreRepo, productService)
 	exportHandler.SetOrderService(orderService)
+	if storageService != nil {
+		exportHandler.SetStorageService(storageService)
+	}
+	exportHandler.SetFirestoreClient(firestoreRepo.GetClient())
 	importHandler := handlers.NewImportHandler(firestoreRepo, productService, firestoreRepo.GetClient())
 	tenantHandler := handlers.NewTenantHandler(firestoreRepo.GetClient())
 	aiHandler := handlers.NewAIHandler(aiService, firestoreRepo, marketplaceRepo, productService, listingService)
@@ -1153,59 +1145,28 @@ func getAIModeStr(svc *services.AIService) string {
 // ============================================================================
 
 func seedGlobalMarketplaceKeys(ctx context.Context, repo *repository.GlobalConfigRepository) {
-	// ── Amazon SP-API keys ──
-	amazonKeys := map[string]string{}
-	envMappings := map[string]string{
-		"AMZ_LWA_CLIENT_ID":         "lwa_client_id",
-		"AMZ_LWA_CLIENT_SECRET":     "lwa_client_secret",
-		"AMZ_LWA_REFRESH_TOKEN":     "refresh_token",
-		"AMZ_AWS_ACCESS_KEY_ID":     "aws_access_key_id",
-		"AMZ_AWS_SECRET_ACCESS_KEY": "aws_secret_access_key",
-		"AMZ_AWS_REGION":            "region",
-		"AMZ_SP_ENDPOINT":           "sp_endpoint",
-		"AMZ_MARKETPLACE_ID":        "marketplace_id",
-	}
-
-	hasAny := false
-	for envKey, credKey := range envMappings {
-		val := os.Getenv(envKey)
-		if val != "" {
-			amazonKeys[credKey] = val
-			hasAny = true
-		}
-	}
-
-	if hasAny {
-		if err := repo.SaveMarketplaceKeys(ctx, "amazon", amazonKeys); err != nil {
-			log.Printf("⚠️  Failed to seed Amazon global keys: %v", err)
-		} else {
-			log.Printf("✅ Amazon global keys seeded (%d keys)", len(amazonKeys))
-		}
-	}
-
-	// ── AmazonNew SP-API keys ──
+	// ── Amazon SP-API keys (OAuth app) ──
 	// Uses LWA OAuth only — no AWS signing credentials needed.
-	// region defaults to eu-west-1 in the client if not explicitly set.
-	amazonnewKeys := map[string]string{}
-	amazonnewEnvMappings := map[string]string{
+	amazonKeys := map[string]string{}
+	amazonEnvMappings := map[string]string{
 		"AMAZON_LWA_CLIENT_ID":     "lwa_client_id",
 		"AMAZON_LWA_CLIENT_SECRET": "lwa_client_secret",
 		"AMAZON_APP_ID":            "app_id",
 		"AMAZON_REDIRECT_URI":      "redirect_uri",
 	}
-	hasAmazonnew := false
-	for envKey, credKey := range amazonnewEnvMappings {
+	hasAmazon := false
+	for envKey, credKey := range amazonEnvMappings {
 		val := os.Getenv(envKey)
 		if val != "" {
-			amazonnewKeys[credKey] = val
-			hasAmazonnew = true
+			amazonKeys[credKey] = val
+			hasAmazon = true
 		}
 	}
-	if hasAmazonnew {
-		if err := repo.SaveMarketplaceKeys(ctx, "amazonnew", amazonnewKeys); err != nil {
-			log.Printf("⚠️  Failed to seed AmazonNew global keys: %v", err)
+	if hasAmazon {
+		if err := repo.SaveMarketplaceKeys(ctx, "amazon", amazonKeys); err != nil {
+			log.Printf("⚠️  Failed to seed Amazon global keys: %v", err)
 		} else {
-			log.Printf("✅ AmazonNew global keys seeded (%d keys)", len(amazonnewKeys))
+			log.Printf("✅ Amazon global keys seeded (%d keys)", len(amazonKeys))
 		}
 	}
 
@@ -1538,6 +1499,9 @@ func setupRouter(
 
 	// EXPORT / IMPORT
 	api.GET("/products/export", exportHandler.ExportProducts)
+	api.GET("/products/export/stream", exportHandler.StreamProductsCSV)
+	api.POST("/export/queue", exportHandler.QueueExport)
+	api.GET("/export/jobs", exportHandler.ListExportJobs)
 	api.GET("/orders/export", exportHandler.ExportOrders)
 	api.GET("/products/export/prices", exportHandler.ExportPrices)
 	api.GET("/products/export/stock", exportHandler.ExportStock)
@@ -1672,8 +1636,8 @@ func setupRouter(
 	// OAuth callback must be outside the auth middleware to receive Etsy's redirect
 	router.GET("/api/v1/etsy/oauth/callback", etsyHandler.OAuthCallback)
 	router.GET("/api/v1/shopify/oauth/callback", shopifyHandler.OAuthCallback)
-	router.GET("/api/v1/amazonnew/oauth/callback", amazonOAuthHandler.OAuthCallback)
-	router.GET("/api/v1/amazonnew/connect", amazonOAuthHandler.PublicConnect)
+	router.GET("/api/v1/amazon/oauth/callback", amazonOAuthHandler.OAuthCallback)
+	router.GET("/api/v1/amazon/connect", amazonOAuthHandler.PublicConnect)
 
 	etsyGroup := api.Group("/etsy")
 	{
@@ -2006,8 +1970,7 @@ func setupRouter(
 	// AMAZON
 	amazonGroup := api.Group("/amazon")
 	{
-		// OAuth (legacy app — no OAuthLogin here)
-		// Note: OAuthLogin and callback are on /amazonnew group below
+		// Listing, schema, catalog routes (OAuth handled by /amazon/oauth/login and /amazon/oauth/callback)
 		amazonGroup.GET("/product-types/search", amazonHandler.SearchProductTypes)
 		amazonGroup.GET("/product-types/definition", amazonHandler.GetProductTypeDefinition)
 		amazonGroup.GET("/catalog/search", amazonHandler.SearchCatalog)
@@ -2031,11 +1994,10 @@ func setupRouter(
 		amazonGroup.PUT("/schemas/refresh-settings", amazonSchemaHandler.SaveRefreshSettings)
 	}
 
-	// AMAZONNEW (MarketMate's own Amazon app — separate from legacy amazon channel)
-	amazonnewGroup := api.Group("/amazonnew")
+	// AMAZON OAuth routes (OAuthLogin — callback registered outside auth middleware above)
+	amazonOAuthGroup := api.Group("/amazon")
 	{
-		amazonnewGroup.GET("/oauth/login", amazonOAuthHandler.OAuthLogin)
-		// Note: /oauth/callback is registered outside auth middleware above
+		amazonOAuthGroup.GET("/oauth/login", amazonOAuthHandler.OAuthLogin)
 	}
 
 	// AI
@@ -2819,6 +2781,9 @@ func setupRouter(
 	// Task 3: User Profile
 	api.GET("/user/profile", userHandler.GetProfile)
 	api.PUT("/user/profile", userHandler.PutProfile)
+	api.POST("/user/phone/send-otp", userHandler.SendPhoneOTP)
+	api.POST("/user/phone/verify-otp", userHandler.VerifyPhoneOTP)
+	api.PUT("/user/notif-prefs", userHandler.UpdateNotifPrefs)
 
 	// Task 4: Email Templates & Logs
 	api.GET("/email-templates", emailTemplateHandler.ListEmailTemplates)

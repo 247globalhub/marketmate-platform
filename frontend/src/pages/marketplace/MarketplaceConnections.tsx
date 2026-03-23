@@ -59,7 +59,7 @@ const FALLBACK_ADAPTERS: AdapterInfo[] = [
     credential_fields: [],
   },
   {
-    id: 'amazonnew', name: 'amazonnew', display_name: 'Amazon (New App)', icon: 'ri-amazon-fill',
+    id: 'amazon', name: 'amazon', display_name: 'Amazon', icon: 'ri-amazon-fill',
     color: 'text-orange-500', requires_oauth: true, is_active: true,
     supported_regions: ['US', 'UK', 'CA', 'DE', 'FR', 'IT', 'ES', 'JP'],
     features: ['import', 'listing', 'fba', 'variations'],
@@ -263,7 +263,7 @@ const TEMU_BASE_URLS: Record<string, string> = {
   'US':      'https://openapi-b.temu.com/openapi/router',
 };
 
-const adapterColor: Record<string, string> = { amazonnew: '#FF9900', amazon: '#FF9900', temu: '#FF6B35', ebay: '#E53238', shopify: '#96BF48', tesco: '#EE1C2E', amazon_vendor: '#E8A020', tiktok: '#010101', etsy: '#F1641E', woocommerce: '#7c3aed', shopwired: '#f97316', walmart: '#0071ce', kaufland: '#e5002b', magento: '#f97316', bigcommerce: '#1C4EBF', onbuy: '#E76119', backmarket: '#14B8A6', zalando: '#FF6600', bol: '#0E4299', lazada: '#F57224' };
+const adapterColor: Record<string, string> = { amazon: '#FF9900', temu: '#FF6B35', ebay: '#E53238', shopify: '#96BF48', tesco: '#EE1C2E', amazon_vendor: '#E8A020', tiktok: '#010101', etsy: '#F1641E', woocommerce: '#7c3aed', shopwired: '#f97316', walmart: '#0071ce', kaufland: '#e5002b', magento: '#f97316', bigcommerce: '#1C4EBF', onbuy: '#E76119', backmarket: '#14B8A6', zalando: '#FF6600', bol: '#0E4299', lazada: '#F57224' };
 
 // Real SVG brand logos — no external dependencies
 function ChannelLogo({ id, size = 24, thumbnailUrl }: { id: string; size?: number; thumbnailUrl?: string }) {
@@ -623,7 +623,7 @@ export default function MarketplaceConnections() {
     setSelectedAdapter(adapter);
     setAccountName('');
     // Temu and eBay have no sandbox — default to production
-    setEnvironment((adapter.id === 'temu' || adapter.id === 'ebay' || adapter.id === 'amazonnew') ? 'production' : 'sandbox');
+    setEnvironment((adapter.id === 'temu' || adapter.id === 'ebay' || adapter.id === 'amazon') ? 'production' : 'sandbox');
     setFormValues({});
     setSaveResult(null);
     setSaveError('');
@@ -655,7 +655,7 @@ export default function MarketplaceConnections() {
     }
 
     // AmazonNew uses OAuth popup flow
-    if (selectedAdapter.id === 'amazonnew') {
+    if (selectedAdapter.id === 'amazon') {
       await handleAmazonOAuth();
       return;
     }
@@ -737,7 +737,7 @@ export default function MarketplaceConnections() {
       const API_BASE_URL = import.meta.env.VITE_API_URL || 'http://localhost:8080/api/v1';
       const name = accountName || 'Amazon Account';
       const res = await fetch(
-        `${API_BASE_URL}/amazonnew/oauth/login?marketplace_id=${encodeURIComponent(marketplaceId)}&account_name=${encodeURIComponent(name)}`,
+        `${API_BASE_URL}/amazon/oauth/login?marketplace_id=${encodeURIComponent(marketplaceId)}&account_name=${encodeURIComponent(name)}`,
         { headers: { 'X-Tenant-Id': getActiveTenantId() } }
       );
       const data = await res.json();
@@ -748,7 +748,7 @@ export default function MarketplaceConnections() {
         return;
       }
 
-      const popup = window.open(data.consent_url, 'amazonnew-oauth', 'width=700,height=800,left=200,top=80');
+      const popup = window.open(data.consent_url, 'amazon-oauth', 'width=700,height=800,left=200,top=80');
       if (!popup) {
         setSaveResult('error');
         setSaveError('Popup was blocked. Please allow popups for this site and try again.');
@@ -757,7 +757,7 @@ export default function MarketplaceConnections() {
       }
 
       const handler = (event: MessageEvent) => {
-        if (event.data?.type === 'amazonnew-oauth-success') {
+        if (event.data?.type === 'amazon-oauth-success') {
           window.removeEventListener('message', handler);
           setSaveResult('success');
           setSaving(false);
@@ -765,7 +765,7 @@ export default function MarketplaceConnections() {
             setCredentials(credRes.data?.data || []);
           });
           setTimeout(() => closeModal(), 1500);
-        } else if (event.data?.type === 'amazonnew-oauth-error') {
+        } else if (event.data?.type === 'amazon-oauth-error') {
           window.removeEventListener('message', handler);
           setSaveResult('error');
           setSaveError(event.data.error || 'Amazon authorisation failed');
@@ -776,11 +776,11 @@ export default function MarketplaceConnections() {
 
       const pollInterval = setInterval(() => {
         try {
-          const result = localStorage.getItem('amazonnew-oauth-result');
+          const result = localStorage.getItem('amazon-oauth-result');
           if (result) {
             const parsed = JSON.parse(result);
-            if (parsed.type === 'amazonnew-oauth-success' && Date.now() - parsed.ts < 30000) {
-              localStorage.removeItem('amazonnew-oauth-result');
+            if (parsed.type === 'amazon-oauth-success' && Date.now() - parsed.ts < 30000) {
+              localStorage.removeItem('amazon-oauth-result');
               clearInterval(pollInterval);
               window.removeEventListener('message', handler);
               setSaveResult('success');
@@ -799,7 +799,7 @@ export default function MarketplaceConnections() {
           credentialService.list().then(credRes => {
             const creds = credRes.data?.data || [];
             setCredentials(creds);
-            if (creds.some((c: any) => c.channel === 'amazonnew')) setSaveResult('success');
+            if (creds.some((c: any) => c.channel === 'amazon')) setSaveResult('success');
           });
           setSaving(false);
         }
@@ -1980,7 +1980,7 @@ export default function MarketplaceConnections() {
               <button onClick={closeModal} style={{ background: 'none', border: 'none', color: 'var(--text-muted)', cursor: 'pointer', fontSize: 20 }}>✕</button>
             </div>
             <div style={{ padding: 24 }}>
-              {selectedAdapter.id === 'amazonnew' && (<><div style={{ padding: 12, marginBottom: 16, borderRadius: 8, background: '#FF990018', border: '1px solid #FF990055', color: 'var(--text-primary)', fontSize: 13 }}><div style={{ fontWeight: 700, marginBottom: 4 }}>📦 Amazon SP-API — OAuth Connection</div><div style={{ color: 'var(--text-secondary)' }}>Click below to open Amazon Seller Central and authorise MarketMate. Each marketplace (UK, US, DE etc.) requires a separate connection.</div></div><div style={{ marginBottom: 16 }}><label style={labelStyle}>Marketplace <span style={{ color: 'var(--danger)' }}>*</span></label><select className="input" style={{ width: '100%' }} value={formValues.marketplace_id || 'A1F83G8C2ARO7P'} onChange={e => setFormValues(prev => ({ ...prev, marketplace_id: e.target.value }))}><option value="A1F83G8C2ARO7P">🇬🇧 Amazon UK</option><option value="ATVPDKIKX0DER">🇺🇸 Amazon US</option><option value="A1PA6795UKMFR9">🇩🇪 Amazon DE</option><option value="A13V1IB3VIYZZH">🇫🇷 Amazon FR</option><option value="APJ6JRA9NG5V4">🇮🇹 Amazon IT</option><option value="A1RKKUPIHCS9HS">🇪🇸 Amazon ES</option></select></div></>)}
+              {selectedAdapter.id === 'amazon' && (<><div style={{ padding: 12, marginBottom: 16, borderRadius: 8, background: '#FF990018', border: '1px solid #FF990055', color: 'var(--text-primary)', fontSize: 13 }}><div style={{ fontWeight: 700, marginBottom: 4 }}>📦 Amazon SP-API — OAuth Connection</div><div style={{ color: 'var(--text-secondary)' }}>Click below to open Amazon Seller Central and authorise MarketMate. Each marketplace (UK, US, DE etc.) requires a separate connection.</div></div><div style={{ marginBottom: 16 }}><label style={labelStyle}>Marketplace <span style={{ color: 'var(--danger)' }}>*</span></label><select className="input" style={{ width: '100%' }} value={formValues.marketplace_id || 'A1F83G8C2ARO7P'} onChange={e => setFormValues(prev => ({ ...prev, marketplace_id: e.target.value }))}><option value="A1F83G8C2ARO7P">🇬🇧 Amazon UK</option><option value="ATVPDKIKX0DER">🇺🇸 Amazon US</option><option value="A1PA6795UKMFR9">🇩🇪 Amazon DE</option><option value="A13V1IB3VIYZZH">🇫🇷 Amazon FR</option><option value="APJ6JRA9NG5V4">🇮🇹 Amazon IT</option><option value="A1RKKUPIHCS9HS">🇪🇸 Amazon ES</option></select></div></>)}
               {selectedAdapter.id === 'amazon' && (<div style={{ padding: 12, marginBottom: 16, borderRadius: 8, background: 'var(--info-glow)', border: '1px solid var(--info)', color: 'var(--info)', fontSize: 13 }}>ℹ Company API keys (LWA Client, AWS) are configured globally. Enter your Refresh Token, Marketplace ID and Seller ID below.</div>)}
               {selectedAdapter.id === 'temu' && (<div style={{ padding: 12, marginBottom: 16, borderRadius: 8, background: '#FF6B351A', border: '1px solid #FF6B3555', color: 'var(--text-primary)', fontSize: 13 }}><div style={{ fontWeight: 700, marginBottom: 4 }}>🛍️ Temu Open Platform</div><div style={{ color: 'var(--text-secondary)' }}>Company API keys are configured globally. Enter your Access Token below.</div></div>)}
               {selectedAdapter.id === 'ebay' && (<><div style={{ padding: 12, marginBottom: 16, borderRadius: 8, background: '#E532381A', border: '1px solid #E5323855', color: 'var(--text-primary)', fontSize: 13 }}><div style={{ fontWeight: 700, marginBottom: 4 }}>🏷️ eBay Developer Program</div><div style={{ color: 'var(--text-secondary)' }}>Company API keys are configured globally. Enter your Refresh Token below.</div></div><div style={{ display: 'flex', gap: 8, marginBottom: 16 }}>{([{ key: true, label: '🔑 Manual Entry', desc: 'Paste refresh token' }, { key: false, label: '🔗 OAuth Login', desc: 'Sign in via eBay' }] as const).map(opt => (<div key={String(opt.key)} onClick={() => setEbayManualEntry(opt.key)} style={{ flex: 1, padding: '10px 12px', borderRadius: 8, cursor: 'pointer', textAlign: 'center', background: ebayManualEntry === opt.key ? '#0064D215' : 'var(--bg-tertiary)', border: `1px solid ${ebayManualEntry === opt.key ? '#0064D2' : 'var(--border)'}` }}><div style={{ fontWeight: 600, fontSize: 13, color: ebayManualEntry === opt.key ? '#0064D2' : 'var(--text-primary)' }}>{opt.label}</div><div style={{ fontSize: 11, color: 'var(--text-muted)', marginTop: 2 }}>{opt.desc}</div></div>))}</div></>)}
@@ -1989,7 +1989,7 @@ export default function MarketplaceConnections() {
                 <label style={labelStyle}>Account Name <span style={{ color: 'var(--danger)' }}>*</span></label>
                 <input className="input" style={{ width: '100%' }} placeholder={`My ${selectedAdapter.display_name} Store`} value={accountName} onChange={e => setAccountName(e.target.value)} autoComplete="off" />
               </div>
-              {selectedAdapter.id !== 'temu' && selectedAdapter.id !== 'amazonnew' && (
+              {selectedAdapter.id !== 'temu' && selectedAdapter.id !== 'amazon' && (
                 <div style={{ marginBottom: 16 }}>
                   <label style={labelStyle}>Environment <span style={{ color: 'var(--danger)' }}>*</span></label>
                   <div style={{ display: 'flex', gap: 12 }}>
@@ -2026,7 +2026,7 @@ export default function MarketplaceConnections() {
               <div style={{ display: 'flex', gap: 12, justifyContent: 'flex-end', marginTop: 8 }}>
                 <button className="btn btn-secondary" onClick={() => { setSaving(false); closeModal(); }}>Cancel</button>
                 <button className="btn btn-primary" onClick={handleSave} disabled={saving}>
-                  {saving ? '⏳ Connecting...' : selectedAdapter.id === 'ebay' && !ebayManualEntry ? '🔗 Connect with eBay' : selectedAdapter.id === 'shopify' ? '🔗 Connect with Shopify' : selectedAdapter.id === 'amazonnew' ? '🔗 Connect with Amazon' : `🔌 Save ${selectedAdapter.display_name} Connection`}
+                  {saving ? '⏳ Connecting...' : selectedAdapter.id === 'ebay' && !ebayManualEntry ? '🔗 Connect with eBay' : selectedAdapter.id === 'shopify' ? '🔗 Connect with Shopify' : selectedAdapter.id === 'amazon' ? '🔗 Connect with Amazon' : `🔌 Save ${selectedAdapter.display_name} Connection`}
                 </button>
               </div>
             </div>
