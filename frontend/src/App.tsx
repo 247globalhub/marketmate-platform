@@ -10,7 +10,8 @@ const LoginPage        = lazy(() => import('./pages/Login'));
 const RegisterPage     = lazy(() => import('./pages/Register'));
 const AcceptInvitePage = lazy(() => import('./pages/AcceptInvite'));
 const SetupWizard      = lazy(() => import('./pages/SetupWizard'));
-const TemuWizard       = lazy(() => import('./pages/TemuWizard'));
+const TemuWizard           = lazy(() => import('./pages/TemuWizard'));
+const MobileConversation   = lazy(() => import('./pages/MobileConversation'));
 
 // ── Dashboard ─────────────────────────────────────────────────────────────────
 const Dashboard             = lazy(() => import('./pages/Dashboard'));
@@ -139,6 +140,7 @@ function App() {
           <Route path="/invite/accept" element={<AcceptInvitePage />} />
           <Route path="/setup"         element={<SetupWizard />} />
           <Route path="/temu-wizard"   element={<TemuWizard />} />
+          <Route path="/mobile/conversation/:id" element={<MobileConversation />} />
 
           {/* ── Authenticated routes (Layout provides the auth guard) ──────── */}
           <Route element={<Layout />}>

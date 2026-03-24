@@ -207,18 +207,18 @@ func processEnrichBatch(ctx context.Context, payload EnrichPayload) error {
 			continue
 		}
 
-		// Mirror images to GCS asynchronously — fire and forget so it doesn't
-		// block the enrich loop or push tasks past Cloud Run timeout.
-		// Amazon CDN URLs remain in the document until the next re-enrichment.
+		// Mirror images to GCS synchronously and replace Amazon CDN URLs with GCS URLs
+		// so the product document always stores permanent GCS URLs.
 		if imgs, ok := normalized["images"].([]map[string]interface{}); ok && len(imgs) > 0 {
-			go func(tenantID, productID string, imgs []map[string]interface{}) {
-				bgCtx := context.Background()
-				for _, img := range imgs {
-					if srcURL, _ := img["url"].(string); srcURL != "" {
-						mirrorImageToGCS(bgCtx, tenantID, productID, srcURL)
+			for _, img := range imgs {
+				if srcURL, _ := img["url"].(string); srcURL != "" {
+					gcsURL := mirrorImageToGCS(ctx, payload.TenantID, item.ProductID, srcURL)
+					if gcsURL != srcURL {
+						img["url"] = gcsURL // Replace Amazon CDN URL with GCS URL
 					}
 				}
-			}(payload.TenantID, item.ProductID, imgs)
+			}
+			normalized["images"] = imgs // Write back updated URLs
 		}
 
 		bulletCount := 0
@@ -1159,9 +1159,9 @@ func updateProductWithEnrichedData(ctx context.Context, client *firestore.Client
 			}
 		}
 		if imgs, ok := n["images"].([]map[string]interface{}); ok && len(imgs) > 0 {
-			if ea, _ := existing["assets"].([]interface{}); len(ea) == 0 {
-				updates = append(updates, firestore.Update{Path: "assets", Value: imgs})
-			}
+			// Always update assets on re-enrichment — this ensures GCS URLs replace
+			// any stale Amazon CDN URLs from previous enrichment runs.
+			updates = append(updates, firestore.Update{Path: "assets", Value: imgs})
 		}
 		if ids, ok := n["identifiers"].(map[string]string); ok {
 			existingIds, _ := existing["identifiers"].(map[string]interface{})

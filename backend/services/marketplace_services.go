@@ -20,6 +20,7 @@ import (
 	"google.golang.org/protobuf/types/known/timestamppb"
 	"module-a/marketplace"
 	ebayClient "module-a/marketplace/clients/ebay"
+	temu "module-a/marketplace/clients/temu"
 	"module-a/models"
 	"module-a/repository"
 
@@ -53,8 +54,8 @@ func (s *MarketplaceService) CreateCredential(ctx context.Context, tenantID stri
 	encryptedData := make(map[string]string)
 	encryptedFields := []string{}
 	for key, value := range req.Credentials {
-		if s.isSensitiveField(key) {
-			encrypted, err := s.encrypt(value)
+		if s.IsSensitiveField(key) {
+			encrypted, err := s.Encrypt(value)
 			if err != nil {
 				return nil, fmt.Errorf("encryption failed: %w", err)
 			}
@@ -141,6 +142,28 @@ func (s *MarketplaceService) GetFullCredentials(ctx context.Context, credential 
 	return s.buildFullCredentials(ctx, credential)
 }
 
+// GetTemuMallInfo fetches the mall/shop info for a Temu credential.
+// Returns the MallInfo (including MallID and MallName) on success, or nil if unavailable.
+// Used during TestConnection to store mall_id for webhook routing.
+func (s *MarketplaceService) GetTemuMallInfo(ctx context.Context, credential *models.MarketplaceCredential) (*temu.MallInfo, error) {
+	mergedCreds, err := s.buildFullCredentials(ctx, credential)
+	if err != nil {
+		return nil, err
+	}
+	baseURL := mergedCreds["base_url"]
+	if baseURL == "" {
+		baseURL = "https://openapi.temu.com"
+	}
+	appKey := mergedCreds["app_key"]
+	appSecret := mergedCreds["app_secret"]
+	accessToken := mergedCreds["access_token"]
+	if appKey == "" || appSecret == "" || accessToken == "" {
+		return nil, fmt.Errorf("incomplete Temu credentials for GetMallInfo")
+	}
+	client := temu.NewClient(baseURL, appKey, appSecret, accessToken)
+	return client.GetMallInfo()
+}
+
 // DecryptCredential decrypts a MarketplaceCredential and returns a DecryptedCredential
 // struct containing the individual fields the tracking service needs to make API calls.
 // The DecryptedCredential type is defined in tracking_service.go (same package).
@@ -177,7 +200,7 @@ func (s *MarketplaceService) DeleteCredential(ctx context.Context, tenantID, cre
 // ENCRYPTION HELPERS
 // ============================================================================
 
-func (s *MarketplaceService) isSensitiveField(key string) bool {
+func (s *MarketplaceService) IsSensitiveField(key string) bool {
 	sensitive := []string{"api_key", "api_secret", "secret", "password", "token", "refresh_token", "access_token", "client_secret", "lwa_client_secret", "aws_secret_access_key"}
 	for _, field := range sensitive {
 		if key == field {
@@ -187,7 +210,7 @@ func (s *MarketplaceService) isSensitiveField(key string) bool {
 	return false
 }
 
-func (s *MarketplaceService) encrypt(plaintext string) (string, error) {
+func (s *MarketplaceService) Encrypt(plaintext string) (string, error) {
 	block, err := aes.NewCipher(s.encryptionKey)
 	if err != nil {
 		return "", err

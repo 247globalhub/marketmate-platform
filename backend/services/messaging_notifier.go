@@ -17,8 +17,11 @@ package services
 
 import (
 	"context"
+	"crypto/hmac"
+	"crypto/sha256"
 	"crypto/tls"
 	"encoding/base64"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -208,8 +211,17 @@ func (n *MessagingNotifier) NotifyAssignment(
 				to := member.NotifPhone
 				// Ensure no whatsapp: prefix for SMS
 				to = strings.TrimPrefix(to, "whatsapp:")
-				msg := fmt.Sprintf("MarketMate: Message assigned to you. Customer: %s, Order: %s. Please respond within 24h.",
-					conv.Customer.Name, conv.OrderNumber)
+				// Generate a deep link so staff can tap to open the exact conversation
+				deepLink := n.generateMobileLink(conv.ConversationID, conv.TenantID)
+				var msg string
+				if deepLink != "" {
+					msg = fmt.Sprintf("MarketMate: New message from %s (Order: %s)\nPreview: %s\n\nReply here: %s",
+						conv.Customer.Name, conv.OrderNumber,
+						truncate(conv.LastMessagePreview, 80), deepLink)
+				} else {
+					msg = fmt.Sprintf("MarketMate: Message assigned to you. Customer: %s, Order: %s. Please respond within 24h.",
+						conv.Customer.Name, conv.OrderNumber)
+				}
 				if err := n.sendTwilio(to, msg); err != nil {
 					log.Printf("[MessagingNotifier] SMS failed to %s: %v", member.NotifPhone, err)
 				} else {
@@ -263,13 +275,9 @@ func (n *MessagingNotifier) sendEmail(toEmail, toName, subject, body string) err
 	msg := []byte(headers + body)
 
 	addr := fmt.Sprintf("%s:%s", host, port)
-	var auth smtp.Auth
-	if username != "" {
-		auth = smtp.PlainAuth("", username, password, host)
-	}
-
-	// Try TLS first, fall back to plain
 	tlsCfg := &tls.Config{ServerName: host}
+
+	// Try implicit TLS first (port 465)
 	conn, err := tls.Dial("tcp", addr, tlsCfg)
 	if err == nil {
 		client, err := smtp.NewClient(conn, host)
@@ -277,7 +285,8 @@ func (n *MessagingNotifier) sendEmail(toEmail, toName, subject, body string) err
 			return err
 		}
 		defer client.Close()
-		if auth != nil {
+		if username != "" {
+			auth := smtp.PlainAuth("", username, password, host)
 			if err := client.Auth(auth); err != nil {
 				return err
 			}
@@ -298,8 +307,38 @@ func (n *MessagingNotifier) sendEmail(toEmail, toName, subject, body string) err
 		return w.Close()
 	}
 
-	// Fall back to STARTTLS
-	return smtp.SendMail(addr, auth, fromSafe, []string{toEmailSafe}, msg)
+	// Fall back to STARTTLS (port 587) — connect plain, upgrade to TLS, then auth
+	client, err := smtp.Dial(addr)
+	if err != nil {
+		return fmt.Errorf("SMTP dial failed: %w", err)
+	}
+	defer client.Close()
+
+	if err := client.StartTLS(tlsCfg); err != nil {
+		return fmt.Errorf("STARTTLS failed: %w", err)
+	}
+
+	if username != "" {
+		auth := smtp.PlainAuth("", username, password, host)
+		if err := client.Auth(auth); err != nil {
+			return fmt.Errorf("SMTP auth failed: %w", err)
+		}
+	}
+
+	if err := client.Mail(fromSafe); err != nil {
+		return err
+	}
+	if err := client.Rcpt(toEmailSafe); err != nil {
+		return err
+	}
+	w, err := client.Data()
+	if err != nil {
+		return err
+	}
+	if _, err := w.Write(msg); err != nil {
+		return err
+	}
+	return w.Close()
 }
 
 // ── Twilio (WhatsApp / SMS) ───────────────────────────────────────────────────
@@ -350,4 +389,35 @@ func (n *MessagingNotifier) sendTwilio(to, body string) error {
 		return fmt.Errorf("Twilio %d: %s", resp.StatusCode, twErr.Message)
 	}
 	return nil
+}
+
+// generateMobileLink creates a 24h signed deep link for a conversation.
+func (n *MessagingNotifier) generateMobileLink(convID, tenantID string) string {
+	if convID == "" || tenantID == "" {
+		return ""
+	}
+	expiry := time.Now().Add(24 * time.Hour).Unix()
+	secret := os.Getenv("CREDENTIAL_ENCRYPTION_KEY")
+	if len(secret) < 16 {
+		secret = "marketmate-mobile-link-secret-32"
+	}
+	payload := fmt.Sprintf("%s:%s:%d", convID, tenantID, expiry)
+	mac := hmac.New(sha256.New, []byte(secret))
+	mac.Write([]byte(payload))
+	token := hex.EncodeToString(mac.Sum(nil))[:16]
+
+	baseURL := os.Getenv("FRONTEND_URL")
+	if baseURL == "" {
+		baseURL = "https://e-lister-site-2026.web.app"
+	}
+	return fmt.Sprintf("%s/mobile/conversation/%s?tenant=%s&exp=%d&token=%s",
+		baseURL, convID, tenantID, expiry, token)
+}
+
+// truncate shortens a string to maxLen chars, appending … if cut.
+func truncate(s string, maxLen int) string {
+	if len(s) <= maxLen {
+		return s
+	}
+	return s[:maxLen] + "…"
 }

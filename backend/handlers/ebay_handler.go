@@ -293,6 +293,25 @@ func (h *EbayHandler) OAuthCallback(c *gin.Context) {
 	log.Printf("[eBay OAuth] Successfully authorized for tenant %s, account '%s' (token expires in %ds, refresh expires in %ds)",
 		tenantID, accountName, tokenResp.ExpiresIn, tokenResp.RefreshTokenExpiresIn)
 
+	// Set up notification preferences for this seller — subscribe to all relevant topics
+	// so they appear in the MarketMate messages portal.
+	webhookURL := fmt.Sprintf("%s/webhooks/orders/ebay",
+		os.Getenv("ORCHESTRATOR_FUNCTION_URL")) // reuse backend base URL env var
+	backendURL := "https://marketmate-api-487246736287.europe-west2.run.app"
+	if u := os.Getenv("BACKEND_URL"); u != "" {
+		backendURL = u
+	}
+	webhookURL = backendURL + "/webhooks/orders/ebay"
+	go func() {
+		client2 := ebay.NewClient(clientID, clientSecret, "", environment == "production")
+		client2.SetTokens(tokenResp.AccessToken, tokenResp.RefreshToken)
+		if err := client2.SetNotificationPreferences(webhookURL); err != nil {
+			log.Printf("[eBay OAuth] SetNotificationPreferences failed (non-fatal): %v", err)
+		} else {
+			log.Printf("[eBay OAuth] Notification preferences set for %s", sellerUsername)
+		}
+	}()
+
 	// Return a simple HTML page that closes itself
 	c.Data(200, "text/html; charset=utf-8", []byte(`
 		<html><body style="font-family:sans-serif;text-align:center;padding:60px">

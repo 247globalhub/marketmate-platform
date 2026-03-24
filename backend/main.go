@@ -2493,6 +2493,10 @@ func setupRouter(
 	api.POST("/messages/:id/reply", messagingHandler.Reply)
 	api.POST("/messages/:id/resolve", messagingHandler.Resolve)
 	api.POST("/messages/:id/read", messagingHandler.MarkRead)
+	api.GET("/messages/:id/mobile-link", messagingHandler.GetMobileLink)
+	// Mobile conversation endpoints — public, verified by HMAC token
+	router.GET("/api/v1/mobile/conversation/:id", messagingHandler.GetMobileConversation)
+	router.POST("/api/v1/mobile/conversation/:id/reply", messagingHandler.MobileReply)
 
 	// ── MODULE K — AUTH (public — no tenant middleware) ─────────────────────
 	// These sit outside the api group so they don't require X-Tenant-Id

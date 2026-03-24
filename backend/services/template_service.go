@@ -592,8 +592,34 @@ func sendWithConfig(cfg MailConfig, toEmail, subject, htmlBody string) error {
 		return err
 	}
 
-	// STARTTLS / plain
-	return smtp.SendMail(addr, auth, cfg.From, []string{toEmail}, []byte(msg))
+	// STARTTLS — connect plain, upgrade to TLS, then auth
+	tlsCfg := &tls.Config{ServerName: cfg.Host}
+	client, err := smtp.Dial(addr)
+	if err != nil {
+		return fmt.Errorf("SMTP dial: %w", err)
+	}
+	defer client.Close()
+	if err := client.StartTLS(tlsCfg); err != nil {
+		return fmt.Errorf("STARTTLS: %w", err)
+	}
+	if cfg.Username != "" {
+		if err := client.Auth(auth); err != nil {
+			return fmt.Errorf("SMTP auth: %w", err)
+		}
+	}
+	if err := client.Mail(cfg.From); err != nil {
+		return fmt.Errorf("SMTP MAIL FROM: %w", err)
+	}
+	if err := client.Rcpt(toEmail); err != nil {
+		return fmt.Errorf("SMTP RCPT TO: %w", err)
+	}
+	wc, err := client.Data()
+	if err != nil {
+		return fmt.Errorf("SMTP DATA: %w", err)
+	}
+	defer wc.Close()
+	_, err = fmt.Fprint(wc, msg)
+	return err
 }
 
 // ============================================================================

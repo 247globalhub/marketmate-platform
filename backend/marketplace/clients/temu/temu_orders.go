@@ -68,6 +68,7 @@ type OrdersRequest struct {
 	UpdateAtEnd                  int64    `json:"updateAtEnd,omitempty"`
 	ParentOrderStatus            int      `json:"parentOrderStatus,omitempty"`  // 0=all
 	RegionID                     int      `json:"regionId,omitempty"`
+	MallID                       int64    `json:"mallId,omitempty"`
 	ParentOrderSnList            []string `json:"parentOrderSnList,omitempty"`
 	SkuID                        int64    `json:"skuId,omitempty"`
 	HasPreSaleOrder              bool     `json:"hasPreSaleOrder,omitempty"`
@@ -145,6 +146,9 @@ func (c *Client) GetOrders(req OrdersRequest) (*OrdersResponse, error) {
 	}
 	if req.RegionID > 0 {
 		params["regionId"] = req.RegionID
+	}
+	if req.MallID > 0 {
+		params["mallId"] = req.MallID
 	}
 	if len(req.ParentOrderSnList) > 0 {
 		params["parentOrderSnList"] = req.ParentOrderSnList

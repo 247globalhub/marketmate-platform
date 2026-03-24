@@ -1,6 +1,7 @@
 import React, { useState, useEffect } from 'react';
 import { useNavigate, Link } from 'react-router-dom';
 import { useAuth, auth, createUserWithEmailAndPassword } from '../contexts/AuthContext';
+import { sendEmailVerification } from 'firebase/auth';
 import { clearActiveTenantId } from '../contexts/TenantContext';
 import './Auth.css';
 
@@ -200,7 +201,7 @@ interface Plan {
 export const RegisterPage: React.FC = () => {
   const navigate = useNavigate();
   const { isAuthenticated, isLoading } = useAuth();
-  const [step, setStep] = useState<'account' | 'plan'>('account');
+  const [step, setStep] = useState<'account' | 'plan' | 'verify_email' | 'verify_phone'>('account');
   const [plans, setPlans] = useState<Plan[]>([]);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState('');
@@ -215,6 +216,19 @@ export const RegisterPage: React.FC = () => {
   // Step 2 — Firebase user created in step 1 for step 2 to use
   const [firebaseUID, setFirebaseUID] = useState('');
   const [selectedPlan, setSelectedPlan] = useState('starter_s');
+
+  // Step 3 — email verification
+  const [resendingEmail, setResendingEmail] = useState(false);
+  const [emailResent, setEmailResent] = useState(false);
+  const [checkingVerified, setCheckingVerified] = useState(false);
+
+  // Step 4 — phone verification
+  const [phone, setPhone] = useState('');
+  const [otpSent, setOtpSent] = useState(false);
+  const [otp, setOtp] = useState('');
+  const [sendingOtp, setSendingOtp] = useState(false);
+  const [verifyingOtp, setVerifyingOtp] = useState(false);
+  const [phoneError, setPhoneError] = useState('');
 
   // Detect referral source from query params (e.g. ?ref=temu)
   const referralSource = new URLSearchParams(window.location.search).get('ref') || '';
@@ -296,16 +310,106 @@ export const RegisterPage: React.FC = () => {
       // see the previous session's marketplace connections.
       clearActiveTenantId();
 
-      // Registration complete — redirect based on referral source
+      // Store the new tenant ID in localStorage so API calls work immediately
+      const tenantId = data.tenant_id;
+      if (tenantId) {
+        localStorage.setItem('marketmate_active_tenant', tenantId);
+      }
+      // Send Firebase email verification
+      if (auth.currentUser) {
+        try { await sendEmailVerification(auth.currentUser); } catch {}
+      }
+      setStep('verify_email');
+    } catch (err: any) {
+      setError(err.message ?? 'Registration failed');
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  // ── Step 3: Email verification handlers ───────────────────────────────────
+  const handleResendEmail = async () => {
+    setResendingEmail(true);
+    try {
+      if (auth.currentUser) {
+        await sendEmailVerification(auth.currentUser);
+        setEmailResent(true);
+        setTimeout(() => setEmailResent(false), 5000);
+      }
+    } catch { } finally { setResendingEmail(false); }
+  };
+
+  const handleCheckEmailVerified = async () => {
+    setCheckingVerified(true);
+    try {
+      if (auth.currentUser) {
+        await auth.currentUser.reload();
+        if (auth.currentUser.emailVerified) {
+          setStep('verify_phone');
+        } else {
+          // Show message that email not yet verified
+          setEmailResent(false);
+          alert('Email not yet verified. Please check your inbox and click the link.');
+        }
+      }
+    } catch { } finally { setCheckingVerified(false); }
+  };
+
+  // ── Step 4: Phone verification handlers ──────────────────────────────────
+  const handleSendOtp = async () => {
+    setPhoneError('');
+    if (!phone.trim()) { setPhoneError('Please enter your mobile number'); return; }
+    setSendingOtp(true);
+    try {
+      const fbToken = auth.currentUser ? await auth.currentUser.getIdToken() : '';
+      const res = await fetch(`${API_URL}/user/phone/send-otp`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${fbToken}` },
+        body: JSON.stringify({ phone: phone.trim(), channel: 'sms' }),
+      });
+      if (!res.ok) {
+        const d = await res.json();
+        setPhoneError(d.error ?? 'Failed to send code');
+        return;
+      }
+      setOtpSent(true);
+    } catch {
+      setPhoneError('Failed to send verification code');
+    } finally { setSendingOtp(false); }
+  };
+
+  const handleVerifyOtp = async () => {
+    setPhoneError('');
+    if (!otp.trim()) { setPhoneError('Please enter the verification code'); return; }
+    setVerifyingOtp(true);
+    try {
+      const fbToken = auth.currentUser ? await auth.currentUser.getIdToken() : '';
+      const res = await fetch(`${API_URL}/user/phone/verify-otp`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${fbToken}` },
+        body: JSON.stringify({ phone: phone.trim(), code: otp.trim() }),
+      });
+      if (!res.ok) {
+        const d = await res.json();
+        setPhoneError(d.error ?? 'Invalid code');
+        return;
+      }
+      // Verification successful — redirect
       if (referralSource === 'temu') {
         navigate('/temu-wizard', { replace: true });
       } else {
         navigate('/', { replace: true });
       }
-    } catch (err: any) {
-      setError(err.message ?? 'Registration failed');
-    } finally {
-      setLoading(false);
+    } catch {
+      setPhoneError('Verification failed');
+    } finally { setVerifyingOtp(false); }
+  };
+
+  const handleSkipPhone = () => {
+    if (referralSource === 'temu') {
+      navigate('/temu-wizard', { replace: true });
+    } else {
+      navigate('/', { replace: true });
     }
   };
 
@@ -320,13 +424,23 @@ export const RegisterPage: React.FC = () => {
         {/* Step indicator */}
         <div className="auth-steps">
           <div className={`auth-step ${step === 'account' ? 'active' : 'done'}`}>
-            <span className="auth-step-num">{step === 'plan' ? '✓' : '1'}</span>
+            <span className="auth-step-num">{step !== 'account' ? '✓' : '1'}</span>
             <span>Account</span>
           </div>
           <div className="auth-step-line" />
-          <div className={`auth-step ${step === 'plan' ? 'active' : ''}`}>
-            <span className="auth-step-num">2</span>
-            <span>Choose plan</span>
+          <div className={`auth-step ${step === 'plan' ? 'active' : ['verify_email','verify_phone'].includes(step) ? 'done' : ''}`}>
+            <span className="auth-step-num">{['verify_email','verify_phone'].includes(step) ? '✓' : '2'}</span>
+            <span>Plan</span>
+          </div>
+          <div className="auth-step-line" />
+          <div className={`auth-step ${step === 'verify_email' ? 'active' : step === 'verify_phone' ? 'done' : ''}`}>
+            <span className="auth-step-num">{step === 'verify_phone' ? '✓' : '3'}</span>
+            <span>Verify email</span>
+          </div>
+          <div className="auth-step-line" />
+          <div className={`auth-step ${step === 'verify_phone' ? 'active' : ''}`}>
+            <span className="auth-step-num">4</span>
+            <span>Verify mobile</span>
           </div>
         </div>
 
@@ -407,7 +521,7 @@ export const RegisterPage: React.FC = () => {
               <Link to="/login" className="auth-link">Sign in</Link>
             </div>
           </>
-        ) : (
+        ) : step === 'plan' ? (
           <>
             <h1 className="auth-title">Choose your plan</h1>
             <p className="auth-subtitle">
@@ -453,11 +567,142 @@ export const RegisterPage: React.FC = () => {
               {error && <div className="auth-error">{error}</div>}
 
               <button type="submit" className="auth-btn-primary" disabled={loading}>
-                {loading ? 'Setting up your account...' : 'Start free trial →'}
+                {loading ? 'Setting up your account...' : 'Continue →'}
               </button>
             </form>
           </>
-        )}
+        ) : step === 'verify_email' ? (
+          <>
+            <h1 className="auth-title">Check your email</h1>
+            <p className="auth-subtitle">We've sent a verification link to <strong>{email}</strong></p>
+
+            <div className="auth-form">
+              <div style={{
+                textAlign: 'center', padding: '32px 16px',
+                background: 'var(--bg-secondary)', borderRadius: 12,
+                border: '1px solid var(--border)', marginBottom: 20,
+              }}>
+                <div style={{ fontSize: 48, marginBottom: 12 }}>📧</div>
+                <p style={{ color: 'var(--text-secondary)', fontSize: 14, lineHeight: 1.6, margin: '0 0 20px' }}>
+                  Click the link in your email to verify your address.<br />
+                  Check your spam folder if you don't see it.
+                </p>
+                <button
+                  type="button"
+                  className="auth-btn-primary"
+                  onClick={handleCheckEmailVerified}
+                  disabled={checkingVerified}
+                  style={{ marginBottom: 12, width: '100%' }}
+                >
+                  {checkingVerified ? 'Checking…' : "I've verified my email →"}
+                </button>
+                {emailResent && (
+                  <div style={{ color: '#22c55e', fontSize: 13, marginBottom: 8 }}>
+                    ✓ Verification email resent
+                  </div>
+                )}
+                <button
+                  type="button"
+                  onClick={handleResendEmail}
+                  disabled={resendingEmail}
+                  style={{
+                    background: 'none', border: 'none', color: 'var(--text-muted)',
+                    fontSize: 13, cursor: 'pointer', textDecoration: 'underline',
+                  }}
+                >
+                  {resendingEmail ? 'Sending…' : 'Resend verification email'}
+                </button>
+              </div>
+
+              <button
+                type="button"
+                onClick={() => setStep('verify_phone')}
+                style={{
+                  background: 'none', border: 'none', color: 'var(--text-muted)',
+                  fontSize: 12, cursor: 'pointer', textDecoration: 'underline',
+                  display: 'block', width: '100%', textAlign: 'center',
+                }}
+              >
+                Skip for now
+              </button>
+            </div>
+          </>
+        ) : step === 'verify_phone' ? (
+          <>
+            <h1 className="auth-title">Verify your mobile</h1>
+            <p className="auth-subtitle">We'll send you SMS alerts for new orders and buyer messages</p>
+
+            <div className="auth-form">
+              <div className="auth-field">
+                <label className="auth-label">Mobile number *</label>
+                <div style={{ display: 'flex', gap: 8 }}>
+                  <input
+                    className="auth-input"
+                    type="tel"
+                    placeholder="+44 7700 000000"
+                    value={phone}
+                    onChange={e => setPhone(e.target.value)}
+                    disabled={otpSent}
+                    style={{ flex: 1 }}
+                  />
+                  <button
+                    type="button"
+                    className="auth-btn-secondary"
+                    onClick={handleSendOtp}
+                    disabled={sendingOtp || !phone.trim()}
+                    style={{ whiteSpace: 'nowrap' }}
+                  >
+                    {sendingOtp ? 'Sending…' : otpSent ? 'Resend' : 'Send Code'}
+                  </button>
+                </div>
+              </div>
+
+              {otpSent && (
+                <div className="auth-field">
+                  <label className="auth-label">Verification code</label>
+                  <p className="auth-subtitle" style={{ marginBottom: 8 }}>
+                    Enter the 6-digit code sent to {phone}
+                  </p>
+                  <div style={{ display: 'flex', gap: 8 }}>
+                    <input
+                      className="auth-input"
+                      type="text"
+                      inputMode="numeric"
+                      placeholder="000000"
+                      maxLength={6}
+                      value={otp}
+                      onChange={e => setOtp(e.target.value.replace(/\D/g, ''))}
+                      style={{ flex: 1, letterSpacing: '0.3em', fontSize: 20, textAlign: 'center' }}
+                      autoFocus
+                    />
+                    <button
+                      type="button"
+                      className="auth-btn-primary"
+                      onClick={handleVerifyOtp}
+                      disabled={verifyingOtp || otp.length < 4}
+                    >
+                      {verifyingOtp ? 'Verifying…' : 'Verify →'}
+                    </button>
+                  </div>
+                </div>
+              )}
+
+              {phoneError && <div className="auth-error">{phoneError}</div>}
+
+              <button
+                type="button"
+                onClick={handleSkipPhone}
+                style={{
+                  background: 'none', border: 'none', color: 'var(--text-muted)',
+                  fontSize: 13, cursor: 'pointer', marginTop: 16, textDecoration: 'underline',
+                  display: 'block', width: '100%', textAlign: 'center',
+                }}
+              >
+                Skip for now — I'll add this later in Settings
+              </button>
+            </div>
+          </>
+        ) : null}
       </div>
     </div>
   );

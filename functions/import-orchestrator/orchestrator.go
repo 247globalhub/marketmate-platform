@@ -51,7 +51,7 @@ var (
 
 const (
 	reportPollInterval = 15 * time.Second
-	reportPollTimeout  = 10 * time.Minute
+	reportPollTimeout  = 7 * time.Minute // Keep under Cloud Run 540s timeout
 	lwaTokenEndpoint   = "https://api.amazon.com/auth/o2/token"
 )
 

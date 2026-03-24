@@ -71,7 +71,18 @@ func (h *TemuOrdersHandler) ImportTemuOrders(ctx context.Context, tenantID, cred
 	
 	log.Printf("Fetching Temu orders from %s (V2 API), region: %d", createdAfter.Format(time.RFC3339), regionID)
 	
+	// Load mall_id from credential object (stored as top-level field by TestConnection)
+	var mallID int64
+	if cred.MallID != "" {
+		fmt.Sscanf(cred.MallID, "%d", &mallID)
+		log.Printf("Using mall_id=%d for Temu order fetch", mallID)
+	} else {
+		log.Printf("WARNING: No mall_id stored for credential %s — run Test Connection to populate it", credentialID)
+	}
+
 	// Fetch orders using Temu V2 API
+	// Use mallId for precise shop filtering if available — regionId alone
+	// returns 0 results on some accounts even when orders exist in the portal.
 	ordersResp, err := client.GetOrders(temu.OrdersRequest{
 		PageNumber:        1,
 		PageSize:          100,
@@ -79,6 +90,7 @@ func (h *TemuOrdersHandler) ImportTemuOrders(ctx context.Context, tenantID, cred
 		CreateBefore:      createdBefore.Unix(),
 		ParentOrderStatus: 2, // 2 = To be shipped (unshipped orders)
 		RegionID:          regionID,
+		MallID:            mallID,
 	})
 	if err != nil {
 		log.Printf("ERROR: Failed to fetch Temu orders: %v", err)

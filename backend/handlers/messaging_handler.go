@@ -3,6 +3,9 @@ package handlers
 import (
 	"bytes"
 	"context"
+	"crypto/hmac"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"encoding/xml"
 	"fmt"
@@ -10,6 +13,7 @@ import (
 	"log"
 	"net/http"
 	"net/url"
+	"os"
 	"strings"
 	"time"
 
@@ -306,6 +310,228 @@ func (h *MessagingHandler) Reply(c *gin.Context) {
 	})
 
 	c.JSON(http.StatusOK, gin.H{"ok": true, "message": msg})
+}
+
+// ============================================================================
+// MOBILE DEEP LINK  GET /api/v1/messages/:id/mobile-link
+// ============================================================================
+// Generates a short-lived signed token that lets a staff member open a
+// specific conversation on their mobile without re-logging in.
+// Token is HMAC-SHA256(convID + ":" + tenantID + ":" + expiry, secret)
+// Valid for 24 hours.
+
+func (h *MessagingHandler) GetMobileLink(c *gin.Context) {
+	tenantID := c.GetString("tenant_id")
+	convID := c.Param("id")
+	ctx := c.Request.Context()
+
+	// Verify conversation exists
+	doc, err := h.convDoc(tenantID, convID).Get(ctx)
+	if err != nil || !doc.Exists() {
+		c.JSON(http.StatusNotFound, gin.H{"error": "Conversation not found"})
+		return
+	}
+
+	// Generate token: HMAC of "convID:tenantID:expiry"
+	expiry := time.Now().Add(24 * time.Hour).Unix()
+	secret := os.Getenv("CREDENTIAL_ENCRYPTION_KEY")
+	if len(secret) < 16 {
+		secret = "marketmate-mobile-link-secret-32"
+	}
+	payload := fmt.Sprintf("%s:%s:%d", convID, tenantID, expiry)
+	mac := hmac.New(sha256.New, []byte(secret))
+	mac.Write([]byte(payload))
+	token := hex.EncodeToString(mac.Sum(nil))[:16] // 16 chars sufficient for 24h link
+
+	baseURL := os.Getenv("FRONTEND_URL")
+	if baseURL == "" {
+		baseURL = "https://e-lister-site-2026.web.app"
+	}
+
+	link := fmt.Sprintf("%s/mobile/conversation/%s?tenant=%s&exp=%d&token=%s",
+		baseURL, convID, tenantID, expiry, token)
+
+	c.JSON(http.StatusOK, gin.H{
+		"link":    link,
+		"expires": expiry,
+	})
+}
+
+// VerifyMobileLinkToken verifies a mobile deep link token.
+// Returns tenantID, convID, and whether it's valid.
+func VerifyMobileLinkToken(convID, tenantID string, expiry int64, token string) bool {
+	if time.Now().Unix() > expiry {
+		return false
+	}
+	secret := os.Getenv("CREDENTIAL_ENCRYPTION_KEY")
+	if len(secret) < 16 {
+		secret = "marketmate-mobile-link-secret-32"
+	}
+	payload := fmt.Sprintf("%s:%s:%d", convID, tenantID, expiry)
+	mac := hmac.New(sha256.New, []byte(secret))
+	mac.Write([]byte(payload))
+	expected := hex.EncodeToString(mac.Sum(nil))[:16]
+	return hmac.Equal([]byte(token), []byte(expected))
+}
+
+// ============================================================================
+// MOBILE CONVERSATION  GET /api/v1/mobile/conversation/:id
+// ============================================================================
+// Public endpoint (verified by token) — returns conversation + messages
+// for the mobile view without requiring Firebase auth.
+
+func (h *MessagingHandler) GetMobileConversation(c *gin.Context) {
+	convID   := c.Param("id")
+	tenantID := c.Query("tenant")
+	expStr   := c.Query("exp")
+	token    := c.Query("token")
+
+	if tenantID == "" || expStr == "" || token == "" {
+		c.JSON(http.StatusUnauthorized, gin.H{"error": "Missing token parameters"})
+		return
+	}
+
+	var expiry int64
+	fmt.Sscanf(expStr, "%d", &expiry)
+
+	if !VerifyMobileLinkToken(convID, tenantID, expiry, token) {
+		c.JSON(http.StatusUnauthorized, gin.H{"error": "Invalid or expired link"})
+		return
+	}
+
+	ctx := c.Request.Context()
+
+	// Load conversation
+	doc, err := h.convDoc(tenantID, convID).Get(ctx)
+	if err != nil {
+		c.JSON(http.StatusNotFound, gin.H{"error": "Conversation not found"})
+		return
+	}
+	var conv models.Conversation
+	doc.DataTo(&conv)
+
+	// Load messages
+	iter := h.msgCol(tenantID, convID).OrderBy("sent_at", firestore.Asc).Documents(ctx)
+	defer iter.Stop()
+	var messages []models.Message
+	for {
+		snap, err := iter.Next()
+		if err == iterator.Done {
+			break
+		}
+		if err != nil {
+			break
+		}
+		var msg models.Message
+		snap.DataTo(&msg)
+		messages = append(messages, msg)
+	}
+
+	c.JSON(http.StatusOK, gin.H{
+		"conversation": conv,
+		"messages":     messages,
+		"tenant_id":    tenantID,
+		"token":        token,
+		"exp":          expiry,
+	})
+}
+
+// ============================================================================
+// MOBILE REPLY  POST /api/v1/mobile/conversation/:id/reply
+// ============================================================================
+// Public endpoint (verified by token) — sends a reply from mobile view.
+
+func (h *MessagingHandler) MobileReply(c *gin.Context) {
+	convID   := c.Param("id")
+	tenantID := c.Query("tenant")
+	expStr   := c.Query("exp")
+	token    := c.Query("token")
+
+	var req struct {
+		Body string `json:"body" binding:"required"`
+	}
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "body is required"})
+		return
+	}
+
+	var expiry int64
+	fmt.Sscanf(expStr, "%d", &expiry)
+
+	if !VerifyMobileLinkToken(convID, tenantID, expiry, token) {
+		c.JSON(http.StatusUnauthorized, gin.H{"error": "Invalid or expired link"})
+		return
+	}
+
+	// Reuse the main Reply logic by setting context values
+	c.Set("tenant_id", tenantID)
+
+	ctx := c.Request.Context()
+
+	doc, err := h.convDoc(tenantID, convID).Get(ctx)
+	if err != nil {
+		c.JSON(http.StatusNotFound, gin.H{"error": "Conversation not found"})
+		return
+	}
+	var conv models.Conversation
+	doc.DataTo(&conv)
+
+	if conv.Channel == "temu" {
+		c.JSON(http.StatusUnprocessableEntity, gin.H{
+			"error": "Temu does not support external messaging. Please reply via Temu Seller Centre.",
+		})
+		return
+	}
+
+	cred, err := h.marketplaceService.GetCredential(ctx, tenantID, conv.ChannelAccountID)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to load credentials"})
+		return
+	}
+	mergedCreds, err := h.marketplaceService.GetFullCredentials(ctx, cred)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to decrypt credentials"})
+		return
+	}
+
+	var sendErr error
+	switch conv.Channel {
+	case "amazon", "amazonnew":
+		sendErr = h.sendAmazonMessage(ctx, mergedCreds, cred.MarketplaceID, conv.MarketplaceThreadID, req.Body)
+	case "ebay":
+		sendErr = h.sendEbayMessage(ctx, mergedCreds, conv.MarketplaceThreadID, conv.Customer.BuyerID, req.Body)
+	}
+
+	if sendErr != nil {
+		c.JSON(http.StatusBadGateway, gin.H{"error": fmt.Sprintf("Marketplace send failed: %v", sendErr)})
+		return
+	}
+
+	now := time.Now()
+	msgID := uuid.New().String()
+	preview := req.Body
+	if len(preview) > 100 {
+		preview = preview[:100] + "…"
+	}
+	msg := models.Message{
+		MessageID:      msgID,
+		ConversationID: convID,
+		Direction:      models.MsgDirectionOutbound,
+		Body:           req.Body,
+		SentBy:         "mobile",
+		SentAt:         now,
+		ReadAt:         &now,
+	}
+	h.msgCol(tenantID, convID).Doc(msgID).Set(ctx, msg)
+	h.convDoc(tenantID, convID).Update(ctx, []firestore.Update{
+		{Path: "status", Value: models.ConvStatusPendingReply},
+		{Path: "last_message_at", Value: now},
+		{Path: "last_message_preview", Value: "You: " + preview},
+		{Path: "unread", Value: false},
+		{Path: "updated_at", Value: now},
+	})
+
+	c.JSON(http.StatusOK, gin.H{"ok": true, "message_id": msgID})
 }
 
 // ============================================================================

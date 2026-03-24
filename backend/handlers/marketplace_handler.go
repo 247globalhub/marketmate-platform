@@ -170,6 +170,97 @@ func (h *MarketplaceHandler) PatchCredential(c *gin.Context) {
 	c.JSON(http.StatusOK, gin.H{"ok": true, "message": "Credential updated"})
 }
 
+// PUT /api/v1/marketplace/credentials/:id/reconnect
+// Re-saves credential data (new access token etc.) and re-runs TestConnection.
+// Used by the Reconnect Account flow to update an existing credential in place
+// rather than creating a duplicate.
+func (h *MarketplaceHandler) ReconnectCredential(c *gin.Context) {
+	tenantID := c.GetString("tenant_id")
+	credentialID := c.Param("id")
+	ctx := c.Request.Context()
+
+	var req models.ConnectMarketplaceRequest
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+
+	// Load existing credential to preserve fields not being updated
+	existing, err := h.marketplaceService.GetCredential(ctx, tenantID, credentialID)
+	if err != nil {
+		c.JSON(http.StatusNotFound, gin.H{"error": "Credential not found"})
+		return
+	}
+
+	// Update account name if provided
+	if req.AccountName != "" {
+		existing.AccountName = req.AccountName
+	}
+
+	// Re-encrypt and merge new credential data
+	for key, value := range req.Credentials {
+		if value == "" || value == "••••••••" {
+			continue // Skip masked/empty values — keep existing
+		}
+		if h.marketplaceService.IsSensitiveField(key) {
+			encrypted, err := h.marketplaceService.Encrypt(value)
+			if err != nil {
+				c.JSON(http.StatusInternalServerError, gin.H{"error": "Encryption failed"})
+				return
+			}
+			existing.CredentialData[key] = encrypted
+			// Add to encrypted fields list if not already there
+			found := false
+			for _, f := range existing.EncryptedFields {
+				if f == key { found = true; break }
+			}
+			if !found {
+				existing.EncryptedFields = append(existing.EncryptedFields, key)
+			}
+		} else {
+			existing.CredentialData[key] = value
+		}
+	}
+
+	// Test the updated credential
+	now := time.Now()
+	testErr := h.marketplaceService.TestConnection(ctx, existing)
+
+	if testErr != nil {
+		existing.LastTestStatus = "failed"
+		existing.LastErrorMessage = testErr.Error()
+	} else {
+		existing.LastTestStatus = "success"
+		existing.LastErrorMessage = ""
+		existing.LastTestedAt = &now
+		existing.Active = true
+		existing.Connected = true
+	}
+	existing.UpdatedAt = now
+
+	// Save back to Firestore
+	if err := h.marketplaceService.SaveCredential(ctx, existing); err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to save credential"})
+		return
+	}
+
+	if testErr != nil {
+		c.JSON(http.StatusOK, gin.H{
+			"ok": false,
+			"connected": false,
+			"error": testErr.Error(),
+		})
+		return
+	}
+
+	c.JSON(http.StatusOK, gin.H{
+		"ok": true,
+		"connected": true,
+		"message": "Reconnected successfully",
+		"credential_id": credentialID,
+	})
+}
+
 // GET /api/v1/marketplace/credentials/:id/config
 func (h *MarketplaceHandler) GetCredentialConfig(c *gin.Context) {
     tenantID := c.GetString("tenant_id")
@@ -225,14 +316,25 @@ func (h *MarketplaceHandler) UpdateCredentialConfig(c *gin.Context) {
 func (h *MarketplaceHandler) TestConnection(c *gin.Context) {
 	tenantID := c.GetString("tenant_id")
 	credentialID := c.Param("id")
+	ctx := c.Request.Context()
+	now := time.Now()
 
-	credential, err := h.marketplaceService.GetCredential(c.Request.Context(), tenantID, credentialID)
+	credential, err := h.marketplaceService.GetCredential(ctx, tenantID, credentialID)
 	if err != nil {
 		c.JSON(http.StatusNotFound, gin.H{"error": "Credential not found"})
 		return
 	}
 
-	if err := h.marketplaceService.TestConnection(c.Request.Context(), credential); err != nil {
+	if err := h.marketplaceService.TestConnection(ctx, credential); err != nil {
+		// Update last_test_status in Firestore — never set active=false
+		h.fsClient.Collection("tenants").Doc(tenantID).
+			Collection("marketplace_credentials").Doc(credentialID).
+			Update(ctx, []firestore.Update{
+				{Path: "last_test_status", Value: "failed"},
+				{Path: "last_error_message", Value: err.Error()},
+				{Path: "last_tested_at", Value: now},
+				{Path: "updated_at", Value: now},
+			})
 		c.JSON(http.StatusOK, gin.H{
 			"connected": false,
 			"error": err.Error(),
@@ -240,10 +342,40 @@ func (h *MarketplaceHandler) TestConnection(c *gin.Context) {
 		return
 	}
 
-	c.JSON(http.StatusOK, gin.H{
+	// Test succeeded — update status and try to get mall_id for Temu
+	updates := []firestore.Update{
+		{Path: "last_test_status", Value: "success"},
+		{Path: "last_error_message", Value: ""},
+		{Path: "last_tested_at", Value: now},
+		{Path: "active", Value: true},
+		{Path: "connected", Value: true},
+		{Path: "updated_at", Value: now},
+	}
+
+	response := gin.H{
 		"connected": true,
-		"message": "Connection successful",
-	})
+		"message":   "Connection successful",
+	}
+
+	// For Temu: fetch mall_id via GetMallInfo and persist it
+	if credential.Channel == "temu" || credential.Channel == "temu_sandbox" {
+		if mallInfo, err := h.marketplaceService.GetTemuMallInfo(ctx, credential); err == nil && mallInfo != nil {
+			mallIDStr := fmt.Sprintf("%d", mallInfo.MallID)
+			updates = append(updates, firestore.Update{Path: "mall_id", Value: mallIDStr})
+			response["mall_id"] = mallIDStr
+			response["mall_name"] = mallInfo.MallName
+			log.Printf("[TestConnection] Temu mall_id=%s name=%s stored for %s/%s",
+				mallIDStr, mallInfo.MallName, tenantID, credentialID)
+		} else if err != nil {
+			log.Printf("[TestConnection] Temu GetMallInfo failed (non-fatal): %v", err)
+		}
+	}
+
+	h.fsClient.Collection("tenants").Doc(tenantID).
+		Collection("marketplace_credentials").Doc(credentialID).
+		Update(ctx, updates)
+
+	c.JSON(http.StatusOK, response)
 }
 
 
@@ -340,34 +472,20 @@ func (h *MarketplaceHandler) runCredentialAudit(
 				result.Error = testErr.Error()
 				summary["failed"]++
 
-				if fix && cred.Active {
-					result.NowActive = false
-					summary["newly_inactive"]++
-					// Update in Firestore
-					h.fsClient.Collection("tenants").Doc(tenantID).
-						Collection("marketplace_credentials").Doc(cred.CredentialID).
-						Update(ctx, []firestore.Update{
-							{Path: "active", Value: false},
-							{Path: "last_test_status", Value: "failed"},
-							{Path: "last_error_message", Value: testErr.Error()},
-							{Path: "last_tested_at", Value: now},
-							{Path: "updated_at", Value: now},
-						})
-					log.Printf("[CredentialAudit] ✗ DEACTIVATED %s/%s (%s — %s): %v",
-						tenantID, cred.AccountName, cred.Channel, cred.CredentialID[:8], testErr)
-				} else {
-					// Update test status but leave active flag alone
-					h.fsClient.Collection("tenants").Doc(tenantID).
-						Collection("marketplace_credentials").Doc(cred.CredentialID).
-						Update(ctx, []firestore.Update{
-							{Path: "last_test_status", Value: "failed"},
-							{Path: "last_error_message", Value: testErr.Error()},
-							{Path: "last_tested_at", Value: now},
-							{Path: "updated_at", Value: now},
-						})
-					log.Printf("[CredentialAudit] ✗ FAILED (not deactivated, fix=false) %s/%s (%s)",
-						tenantID, cred.AccountName, cred.Channel)
-				}
+				// IMPORTANT: Never set active=false from the audit.
+				// Credentials with failed tokens must remain visible in the UI
+				// so users can see them and use the Reconnect button.
+				// last_test_status="failed" drives the UI reconnect state.
+				h.fsClient.Collection("tenants").Doc(tenantID).
+					Collection("marketplace_credentials").Doc(cred.CredentialID).
+					Update(ctx, []firestore.Update{
+						{Path: "last_test_status", Value: "failed"},
+						{Path: "last_error_message", Value: testErr.Error()},
+						{Path: "last_tested_at", Value: now},
+						{Path: "updated_at", Value: now},
+					})
+				log.Printf("[CredentialAudit] ✗ FAILED (token issue, credential kept visible) %s/%s (%s — %s): %v",
+					tenantID, cred.AccountName, cred.Channel, cred.CredentialID[:8], testErr)
 			} else {
 				result.Status = "ok"
 				result.NowActive = true

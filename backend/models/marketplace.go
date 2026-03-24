@@ -369,6 +369,8 @@ type MarketplaceCredential struct {
 	
 	// Status
 	Active           bool                   `firestore:"active" json:"active"`
+	Connected        bool                   `firestore:"connected,omitempty" json:"connected,omitempty"`
+	MallID           string                 `firestore:"mall_id,omitempty" json:"mall_id,omitempty"`
 	LastTestedAt     *time.Time             `firestore:"last_tested_at,omitempty" json:"last_tested_at,omitempty"`
 	LastTestStatus   string                 `firestore:"last_test_status,omitempty" json:"last_test_status,omitempty"` // "success", "failed"
 	LastErrorMessage string                 `firestore:"last_error_message,omitempty" json:"last_error_message,omitempty"`

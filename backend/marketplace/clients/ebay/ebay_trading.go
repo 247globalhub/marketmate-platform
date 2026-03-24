@@ -835,3 +835,74 @@ func convertSellerListItem(x sellerListXMLItem) *TradingItemDetail {
 
 	return item
 }
+
+// ============================================================================
+// SetNotificationPreferences — subscribe seller to all relevant eBay topics
+// ============================================================================
+// Subscribes the seller to cancellation, return, feedback, and message topics
+// with JSON encoding so our webhook handler can parse them without XML/SOAP.
+// Called automatically after OAuth connection.
+//
+// Topics subscribed:
+//   CANCELLATION_CREATED — buyer requests cancellation
+//   RETURN_CREATED       — buyer opens return
+//   RETURN_CLOSED        — return case closed
+//   AskSellerQuestion    — buyer sends message
+//   FeedbackLeft         — buyer leaves feedback
+//   FixedPriceTransaction — order placed
+func (c *Client) SetNotificationPreferences(webhookURL string) error {
+	xml := fmt.Sprintf(`<?xml version="1.0" encoding="utf-8"?>
+<SetNotificationPreferencesRequest xmlns="urn:ebay:apis:eBLBaseComponents">
+  <ApplicationDeliveryPreferences>
+    <ApplicationEnable>Enable</ApplicationEnable>
+    <ApplicationURL>%s</ApplicationURL>
+    <DeviceType>Platform</DeviceType>
+    <PayloadVersion>1173</PayloadVersion>
+  </ApplicationDeliveryPreferences>
+  <UserDeliveryPreferenceArray>
+    <NotificationEnable>
+      <EventType>CANCELLATION_CREATED</EventType>
+      <EventEnable>Enable</EventEnable>
+    </NotificationEnable>
+    <NotificationEnable>
+      <EventType>RETURN_CREATED</EventType>
+      <EventEnable>Enable</EventEnable>
+    </NotificationEnable>
+    <NotificationEnable>
+      <EventType>RETURN_CLOSED</EventType>
+      <EventEnable>Enable</EventEnable>
+    </NotificationEnable>
+    <NotificationEnable>
+      <EventType>AskSellerQuestion</EventType>
+      <EventEnable>Enable</EventEnable>
+    </NotificationEnable>
+    <NotificationEnable>
+      <EventType>FeedbackLeft</EventType>
+      <EventEnable>Enable</EventEnable>
+    </NotificationEnable>
+    <NotificationEnable>
+      <EventType>FixedPriceTransaction</EventType>
+      <EventEnable>Enable</EventEnable>
+    </NotificationEnable>
+  </UserDeliveryPreferenceArray>
+</SetNotificationPreferencesRequest>`, webhookURL)
+
+	resp, err := c.tradingCall("SetNotificationPreferences", xml)
+	if err != nil {
+		return fmt.Errorf("SetNotificationPreferences: %w", err)
+	}
+
+	// Check for errors in response
+	respStr := string(resp)
+	if strings.Contains(respStr, "<Ack>Failure</Ack>") {
+		// Extract error message
+		start := strings.Index(respStr, "<ShortMessage>")
+		end := strings.Index(respStr, "</ShortMessage>")
+		if start >= 0 && end > start {
+			return fmt.Errorf("SetNotificationPreferences failed: %s", respStr[start+14:end])
+		}
+		return fmt.Errorf("SetNotificationPreferences failed")
+	}
+
+	return nil
+}

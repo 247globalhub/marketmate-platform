@@ -116,6 +116,7 @@ func (h *SettingsHandler) UpdateEmailSettings(c *gin.Context) {
 func (h *SettingsHandler) TestEmailSettings(c *gin.Context) {
 	var req struct {
 		SMTPConfig map[string]interface{} `json:"smtp_config"`
+		To         string                 `json:"to"`
 	}
 	if err := c.ShouldBindJSON(&req); err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
@@ -144,9 +145,13 @@ func (h *SettingsHandler) TestEmailSettings(c *gin.Context) {
 	if fromName == "" {
 		fromName = "MarketMate"
 	}
-	toAddr := username
+	// Use explicit "to" if provided, otherwise fall back to username
+	toAddr := req.To
 	if toAddr == "" {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "Username is required (used as recipient for test)"})
+		toAddr = username
+	}
+	if toAddr == "" {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "Provide a 'to' address or username for the test recipient"})
 		return
 	}
 
@@ -200,16 +205,16 @@ func dialAndSend(addr, host, username, password, from, to string, msg []byte, us
 		return w.Close()
 	}
 
-	// Default: STARTTLS or plain
-	if useTLS {
-		return smtp.SendMail(addr, auth, from, []string{to}, msg)
-	}
-	// Plain (no TLS) — rarely needed but supported
+	// Default: STARTTLS (port 587) — connect plain, upgrade to TLS, then auth
+	tlsConfig := &tls.Config{ServerName: host}
 	client, err := smtp.Dial(addr)
 	if err != nil {
 		return fmt.Errorf("SMTP dial: %w", err)
 	}
 	defer client.Close()
+	if err := client.StartTLS(tlsConfig); err != nil {
+		return fmt.Errorf("STARTTLS: %w", err)
+	}
 	if username != "" {
 		if err := client.Auth(auth); err != nil {
 			return fmt.Errorf("SMTP auth: %w", err)

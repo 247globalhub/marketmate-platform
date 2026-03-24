@@ -210,6 +210,14 @@ export const credentialService = {
   delete: (id: string) =>
     apiClient.delete(`/marketplace/credentials/${id}`),
 
+  /** PATCH /marketplace/credentials/:id — update fields (active, inventory_sync_enabled) */
+  update: (id: string, data: Partial<ConnectMarketplaceRequest>) =>
+    apiClient.patch(`/marketplace/credentials/${id}`, data),
+
+  /** PUT /marketplace/credentials/:id/reconnect — update credential data in place + re-test */
+  reconnect: (id: string, data: ConnectMarketplaceRequest) =>
+    apiClient.put(`/marketplace/credentials/${id}/reconnect`, data),
+
   /** POST /marketplace/credentials/:id/test */
   test: (id: string) =>
     apiClient.post(`/marketplace/credentials/${id}/test`),

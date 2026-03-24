@@ -164,6 +164,10 @@ func readBodyBytes(c *gin.Context) ([]byte, error) {
 // ============================================================================
 
 // EbayWebhook handles POST /webhooks/orders/ebay
+// Accepts both:
+//   - JSON (Commerce Notification API / Platform Notifications with JSON encoding)
+//   - XML/SOAP (Platform Notifications default format)
+// All topics are routed to the messages portal so users see everything.
 func (h *OrderWebhookHandler) EbayWebhook(c *gin.Context) {
 	body, err := readBodyBytes(c)
 	if err != nil {
@@ -183,63 +187,217 @@ func (h *OrderWebhookHandler) EbayWebhook(c *gin.Context) {
 		}
 	}
 
-	// Verify signature.
+	ctx := c.Request.Context()
+	contentType := c.GetHeader("Content-Type")
+
+	// Detect XML/SOAP Platform Notifications and parse them
+	if strings.Contains(contentType, "text/xml") || strings.HasPrefix(strings.TrimSpace(string(body)), "<?xml") || strings.HasPrefix(strings.TrimSpace(string(body)), "<soapenv") {
+		h.handleEbaySOAPNotification(c, ctx, body)
+		return
+	}
+
+	// JSON notification — verify signature if token configured
 	verificationToken := os.Getenv("EBAY_NOTIFICATION_VERIFICATION_TOKEN")
 	if verificationToken != "" {
 		sig := c.GetHeader("X-EBAY-SIGNATURE")
-		if !verifyHMACSHA256(body, sig, verificationToken) {
+		if sig != "" && !verifyHMACSHA256(body, sig, verificationToken) {
 			log.Printf("[Webhook:ebay] invalid signature")
 			c.JSON(http.StatusUnauthorized, gin.H{"error": "invalid signature"})
 			return
 		}
 	}
 
-	// Parse the notification to extract metadata.
+	// Parse JSON notification
 	var notification struct {
 		Metadata struct {
 			Topic string `json:"topic"`
 		} `json:"metadata"`
 		Notification struct {
 			Data struct {
-				Username string `json:"username"` // eBay seller username
+				Username string `json:"username"`
 			} `json:"data"`
 		} `json:"notification"`
 	}
 	_ = json.Unmarshal(body, &notification)
 
-	log.Printf("[Webhook:ebay] received topic=%s", notification.Metadata.Topic)
-
 	topic := notification.Metadata.Topic
+	username := notification.Notification.Data.Username
+	log.Printf("[Webhook:ebay] JSON topic=%s username=%s", topic, username)
 
 	// Route message topics to the messaging handler
 	if topic == "ASK_SELLER_QUESTION" || topic == "BUYER_INITIATED_OFFER" {
-		h.handleEbayMessageWebhook(c, body, notification.Notification.Data.Username)
+		h.handleEbayMessageWebhook(c, body, username)
 		return
 	}
 
 	// Route cancellation/return topics to alert handler
 	if topic == "CANCELLATION_CREATED" || topic == "RETURN_CREATED" || topic == "RETURN_CLOSED" {
-		h.handleEbayCancelReturnWebhook(c, body, topic, notification.Notification.Data.Username)
+		h.handleEbayCancelReturnWebhook(c, body, topic, username)
 		return
 	}
 
-	// Only trigger imports for order-related topics.
-	if !strings.HasPrefix(topic, "ORDER") && topic != "MARKETPLACE_ACCOUNT_DELETION" {
+	// Route ALL other topics to messages portal as info notifications
+	if topic != "" && !strings.HasPrefix(topic, "ORDER") && topic != "MARKETPLACE_ACCOUNT_DELETION" {
+		go h.createEbayInfoTicket(ctx, topic, username, body)
 		c.JSON(http.StatusOK, gin.H{"ok": true})
 		return
 	}
 
-	// Find the matching credential by seller username if present, otherwise
-	// trigger all active eBay credentials (safe because dedup is in CreateOrder).
-	ctx := c.Request.Context()
-	username := notification.Notification.Data.Username
-
-	creds, err := h.repo.ListAllActiveCredentials(ctx)
-	if err != nil {
-		c.JSON(http.StatusOK, gin.H{"ok": true}) // always 200 to eBay
-		return
+	// Order topics — trigger import
+	if strings.HasPrefix(topic, "ORDER") || topic == "MARKETPLACE_ACCOUNT_DELETION" {
+		creds, err := h.repo.ListAllActiveCredentials(ctx)
+		if err != nil {
+			c.JSON(http.StatusOK, gin.H{"ok": true})
+			return
+		}
+		for _, cred := range creds {
+			if cred.Channel != "ebay" {
+				continue
+			}
+			if username != "" && cred.CredentialData["seller_username"] != username {
+				continue
+			}
+			if cred.Config.Orders.Enabled {
+				go h.triggerImportForCredential(cred.TenantID, cred.CredentialID, "ebay")
+			}
+		}
 	}
 
+	c.JSON(http.StatusOK, gin.H{"ok": true})
+}
+
+// handleEbaySOAPNotification parses SOAP/XML Platform Notifications and routes
+// them to the messages portal. All topics create a conversation entry so users
+// can see everything in one place.
+func (h *OrderWebhookHandler) handleEbaySOAPNotification(c *gin.Context, ctx context.Context, body []byte) {
+	bodyStr := string(body)
+
+	// Extract NotificationEventName from XML
+	eventName := extractXMLValue(bodyStr, "NotificationEventName")
+	if eventName == "" {
+		// Try SOAPAction header as fallback
+		soap := c.GetHeader("SOAPAction")
+		if idx := strings.LastIndex(soap, "/"); idx >= 0 {
+			eventName = strings.Trim(soap[idx+1:], `"`)
+		}
+	}
+
+	// Extract seller username
+	username := extractXMLValue(bodyStr, "UserID")
+	if username == "" {
+		username = extractXMLValue(bodyStr, "SellerUserID")
+	}
+
+	log.Printf("[Webhook:ebay] SOAP event=%s username=%s", eventName, username)
+
+	// Route to appropriate handler based on event name
+	switch eventName {
+	case "CANCELLATION_CREATED":
+		h.handleEbayCancelReturnWebhook(c, body, "CANCELLATION_CREATED", username)
+		return
+	case "RETURN_CREATED":
+		h.handleEbayCancelReturnWebhook(c, body, "RETURN_CREATED", username)
+		return
+	case "RETURN_CLOSED":
+		h.handleEbayCancelReturnWebhook(c, body, "RETURN_CLOSED", username)
+		return
+	case "AskSellerQuestion":
+		// Extract message details from XML and create conversation
+		orderID := extractXMLValue(bodyStr, "ItemID")
+		buyerName := extractXMLValue(bodyStr, "SenderID")
+		msgBody := extractXMLValue(bodyStr, "Body")
+		h.createEbaySOAPMessageTicket(ctx, username, buyerName, orderID, msgBody)
+	case "FeedbackLeft":
+		orderID := extractXMLValue(bodyStr, "ItemID")
+		feedbackType := extractXMLValue(bodyStr, "CommentType")
+		comment := extractXMLValue(bodyStr, "CommentText")
+		h.createEbaySOAPMessageTicket(ctx, username, "eBay Buyer", orderID,
+			fmt.Sprintf("Feedback received: %s\n\n%s", feedbackType, comment))
+	default:
+		if eventName != "" {
+			go h.createEbayInfoTicket(ctx, eventName, username, body)
+		}
+	}
+
+	c.JSON(http.StatusOK, gin.H{"ok": true})
+}
+
+// extractXMLValue extracts the text content of the first matching XML tag.
+func extractXMLValue(xml, tag string) string {
+	open := "<" + tag + ">"
+	close := "</" + tag + ">"
+	start := strings.Index(xml, open)
+	if start < 0 {
+		// Try with namespace prefix
+		start = strings.Index(xml, ":"+tag+">")
+		if start >= 0 {
+			start = strings.LastIndex(xml[:start], "<") + 1
+			close = "</" + xml[start:strings.Index(xml[start:], ">")+start] + ">"
+			open = xml[start-1 : strings.Index(xml[start-1:], ">")+start]
+		} else {
+			return ""
+		}
+	}
+	start += len(open)
+	end := strings.Index(xml[start:], close)
+	if end < 0 {
+		return ""
+	}
+	return strings.TrimSpace(xml[start : start+end])
+}
+
+// createEbaySOAPMessageTicket creates a messaging conversation from a SOAP notification.
+func (h *OrderWebhookHandler) createEbaySOAPMessageTicket(ctx context.Context, sellerUsername, buyerName, itemID, msgBody string) {
+	if h.firestoreClient == nil {
+		return
+	}
+	creds, _ := h.repo.ListAllActiveCredentials(ctx)
+	for _, cred := range creds {
+		if cred.Channel != "ebay" {
+			continue
+		}
+		if sellerUsername != "" && cred.CredentialData["seller_username"] != sellerUsername {
+			continue
+		}
+		now := time.Now()
+		convID := fmt.Sprintf("ebay_msg_%s_%d", itemID, now.UnixNano())
+		conv := models.Conversation{
+			ConversationID:     convID,
+			TenantID:           cred.TenantID,
+			Channel:            "ebay",
+			ChannelAccountID:   cred.CredentialID,
+			OrderNumber:        itemID,
+			Customer:           models.ConversationCustomer{Name: buyerName},
+			Subject:            fmt.Sprintf("eBay Message — Item %s", itemID),
+			Status:             models.ConvStatusOpen,
+			LastMessageAt:      now,
+			LastMessagePreview: msgBody[:min(100, len(msgBody))],
+			Unread:             true,
+			MessageCount:       1,
+			CreatedAt:          now,
+			UpdatedAt:          now,
+		}
+		h.firestoreClient.Collection(fmt.Sprintf("tenants/%s/conversations", cred.TenantID)).Doc(convID).Set(ctx, conv)
+		msgID := fmt.Sprintf("ebay_msg_%d", now.UnixNano())
+		msg := models.Message{
+			MessageID:      msgID,
+			ConversationID: convID,
+			Direction:      models.MsgDirectionInbound,
+			Body:           msgBody,
+			SentBy:         buyerName,
+			SentAt:         now,
+		}
+		h.firestoreClient.Collection(fmt.Sprintf("tenants/%s/conversations/%s/messages", cred.TenantID, convID)).Doc(msgID).Set(ctx, msg)
+		break // Only create for first matching credential
+	}
+}
+
+// createEbayInfoTicket creates an informational message for any unhandled topic.
+func (h *OrderWebhookHandler) createEbayInfoTicket(ctx context.Context, topic, username string, body []byte) {
+	if h.firestoreClient == nil {
+		return
+	}
+	creds, _ := h.repo.ListAllActiveCredentials(ctx)
 	for _, cred := range creds {
 		if cred.Channel != "ebay" {
 			continue
@@ -247,12 +405,28 @@ func (h *OrderWebhookHandler) EbayWebhook(c *gin.Context) {
 		if username != "" && cred.CredentialData["seller_username"] != username {
 			continue
 		}
-		if cred.Config.Orders.Enabled {
-			go h.triggerImportForCredential(cred.TenantID, cred.CredentialID, "ebay")
+		now := time.Now()
+		convID := fmt.Sprintf("ebay_info_%s_%d", topic, now.UnixNano())
+		subject := fmt.Sprintf("eBay Notification: %s", topic)
+		preview := fmt.Sprintf("eBay sent a %s notification.", topic)
+		conv := models.Conversation{
+			ConversationID:     convID,
+			TenantID:           cred.TenantID,
+			Channel:            "ebay",
+			ChannelAccountID:   cred.CredentialID,
+			Subject:            subject,
+			Customer:           models.ConversationCustomer{Name: "eBay Platform"},
+			Status:             models.ConvStatusOpen,
+			LastMessageAt:      now,
+			LastMessagePreview: preview,
+			Unread:             true,
+			MessageCount:       1,
+			CreatedAt:          now,
+			UpdatedAt:          now,
 		}
+		h.firestoreClient.Collection(fmt.Sprintf("tenants/%s/conversations", cred.TenantID)).Doc(convID).Set(ctx, conv)
+		break
 	}
-
-	c.JSON(http.StatusOK, gin.H{"ok": true})
 }
 
 // ============================================================================

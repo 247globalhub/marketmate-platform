@@ -60,9 +60,11 @@ func (r *MarketplaceRepository) GetCredential(ctx context.Context, tenantID, cre
 }
 
 func (r *MarketplaceRepository) ListCredentials(ctx context.Context, tenantID string) ([]models.MarketplaceCredential, error) {
+	// NOTE: We intentionally do NOT filter by active=true here.
+	// Inactive/failed credentials must still appear in the UI so users can reconnect them.
+	// The audit sets last_test_status="failed" but does not hide credentials from the UI.
 	iter := r.client.Collection("tenants").Doc(tenantID).
 		Collection("marketplace_credentials").
-		Where("active", "==", true).
 		Documents(ctx)
 
 	var credentials []models.MarketplaceCredential

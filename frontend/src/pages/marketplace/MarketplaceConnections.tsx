@@ -24,14 +24,10 @@ import {
 const FALLBACK_ADAPTERS: AdapterInfo[] = [
   {
     id: 'amazon', name: 'amazon', display_name: 'Amazon', icon: 'ri-amazon-fill',
-    color: 'text-orange-600', requires_oauth: true, is_active: false,
+    color: 'text-orange-600', requires_oauth: true, is_active: true,
     supported_regions: ['US', 'UK', 'CA', 'DE', 'FR', 'IT', 'ES', 'JP'],
     features: ['import', 'listing', 'fba', 'variations'],
-    credential_fields: [
-      { key: 'refresh_token', label: 'Refresh Token', type: 'password', required: true },
-      { key: 'marketplace_id', label: 'Marketplace ID', type: 'text', required: true },
-      { key: 'seller_id', label: 'Seller ID', type: 'text', required: true },
-    ],
+    credential_fields: [],
   },
   {
     id: 'temu', name: 'temu', display_name: 'Temu', icon: 'ri-store-2-fill',
@@ -56,13 +52,6 @@ const FALLBACK_ADAPTERS: AdapterInfo[] = [
     id: 'shopify', name: 'shopify', display_name: 'Shopify', icon: 'ri-shopping-cart-fill',
     color: 'text-green-600', requires_oauth: true, is_active: true,
     features: ['listing', 'import', 'order_sync', 'inventory_sync', 'price_sync', 'tracking'],
-    credential_fields: [],
-  },
-  {
-    id: 'amazon', name: 'amazon', display_name: 'Amazon', icon: 'ri-amazon-fill',
-    color: 'text-orange-500', requires_oauth: true, is_active: true,
-    supported_regions: ['US', 'UK', 'CA', 'DE', 'FR', 'IT', 'ES', 'JP'],
-    features: ['import', 'listing', 'fba', 'variations'],
     credential_fields: [],
   },
   {
@@ -443,6 +432,7 @@ export default function MarketplaceConnections() {
   const [saveError, setSaveError] = useState('');
 
   const [testingId, setTestingId] = useState<string | null>(null);
+  const [reconnectingCredId, setReconnectingCredId] = useState<string | null>(null);
   const [testResult, setTestResult] = useState<Record<string, 'success' | 'error'>>({});
   const [ebayManualEntry, setEbayManualEntry] = useState(true);
 
@@ -631,7 +621,7 @@ export default function MarketplaceConnections() {
     setModalOpen(true);
   }
 
-  function closeModal() { setModalOpen(false); setSelectedAdapter(null); }
+  function closeModal() { setModalOpen(false); setSelectedAdapter(null); setReconnectingCredId(null); }
 
   async function handleSave() {
     if (!selectedAdapter) return;
@@ -719,7 +709,17 @@ export default function MarketplaceConnections() {
       if (formValues.marketplace_id) {
         (payload as any).marketplace_id = formValues.marketplace_id;
       }
-      await credentialService.create(payload);
+      // If reconnecting an existing credential, update in place (no duplicate created)
+      if (reconnectingCredId) {
+        const res = await credentialService.reconnect(reconnectingCredId, payload);
+        if (!res.data?.connected) {
+          setSaveResult('error');
+          setSaveError(res.data?.error || 'Reconnection failed — check your credentials');
+          return;
+        }
+      } else {
+        await credentialService.create(payload);
+      }
       setSaveResult('success');
       const credRes = await credentialService.list();
       setCredentials(credRes.data?.data || []);
@@ -1354,9 +1354,41 @@ export default function MarketplaceConnections() {
     setTestingId(credId);
     try {
       const res = await credentialService.test(credId);
-      setTestResult(prev => ({ ...prev, [credId]: res.data?.connected ? 'success' : 'error' }));
+      const ok = res.data?.connected;
+      setTestResult(prev => ({ ...prev, [credId]: ok ? 'success' : 'error' }));
+      // If test succeeded, update local credential status and store mall_id for Temu
+      if (ok) {
+        setCredentials(prev => prev.map(c => {
+          if (c.credential_id !== credId) return c;
+          const updated = { ...c, last_test_status: 'success' };
+          if (res.data?.mall_id) (updated as any).mall_id = res.data.mall_id;
+          return updated;
+        }));
+      } else {
+        setCredentials(prev => prev.map(c =>
+          c.credential_id === credId ? { ...c, last_test_status: 'failed' } : c
+        ));
+      }
     } catch { setTestResult(prev => ({ ...prev, [credId]: 'error' })); }
     finally { setTestingId(null); }
+  }
+
+  function handleReconnect(cred: MarketplaceCredential) {
+    // Find the adapter definition for this channel
+    const adapter = adapters.find(a => a.id === cred.channel) ||
+      FALLBACK_ADAPTERS.find(a => a.id === cred.channel);
+    if (!adapter) { alert('Cannot find adapter for ' + cred.channel); return; }
+    // Store the credential being reconnected so handleSave uses PUT /reconnect
+    setReconnectingCredId(cred.credential_id);
+    // Pre-fill the account name so the user doesn't have to retype it
+    setAccountName(cred.account_name || '');
+    setEnvironment((cred as any).environment || 'production');
+    setFormValues({});
+    setSaveResult(null);
+    setSaveError('');
+    setEbayManualEntry(true);
+    setSelectedAdapter(adapter);
+    setModalOpen(true);
   }
 
   async function handleDelete(credId: string) {
@@ -1519,7 +1551,7 @@ export default function MarketplaceConnections() {
               return (
                 <div key={cred.credential_id} style={{
                   display: 'grid',
-                  gridTemplateColumns: '44px 1fr auto auto auto auto auto auto',
+                  gridTemplateColumns: cred.last_test_status === 'failed' ? '44px 1fr auto' : '44px 1fr auto auto auto auto auto auto',
                   alignItems: 'center',
                   gap: 16,
                   padding: '14px 18px',
@@ -1569,7 +1601,8 @@ export default function MarketplaceConnections() {
                     )}
                   </div>
 
-                  {/* Toggle: Order Processing */}
+                  {/* Toggles — only shown for healthy credentials */}
+                  {cred.last_test_status !== 'failed' ? (<>
                   <ToggleWithLabel
                     label="Order Processing"
                     checked={(cred as any).order_processing_enabled ?? true}
@@ -1577,8 +1610,6 @@ export default function MarketplaceConnections() {
                     disabled={isTogglingOrders}
                     accentColor="var(--primary)"
                   />
-
-                  {/* Toggle: Pricing Sync */}
                   <ToggleWithLabel
                     label="Pricing Sync"
                     checked={(cred as any).pricing_sync_enabled ?? false}
@@ -1586,8 +1617,6 @@ export default function MarketplaceConnections() {
                     disabled={isTogglingPricing}
                     accentColor="#f59e0b"
                   />
-
-                  {/* Toggle: Notifications */}
                   <ToggleWithLabel
                     label="Notifications"
                     checked={(cred as any).notifications_enabled ?? false}
@@ -1596,8 +1625,6 @@ export default function MarketplaceConnections() {
                     accentColor="#8b5cf6"
                     subtitle={(cred as any).notifications_mode === 'webhook' ? 'Webhook' : 'Polling'}
                   />
-
-                  {/* Toggle: Active */}
                   <ToggleWithLabel
                     label="Active"
                     checked={cred.active ?? true}
@@ -1605,36 +1632,69 @@ export default function MarketplaceConnections() {
                     disabled={isTogglingActive}
                     accentColor="#22c55e"
                   />
+                  </>) : null}
 
                   {/* Actions */}
                   <div style={{ display: 'flex', gap: 6, flexShrink: 0, alignItems: 'center' }}>
-                    <ActionIconBtn title="Configure" onClick={() => navigate(`/marketplace/channels/${cred.credential_id}/config`)}>⚙️</ActionIconBtn>
-                    <button
-                      title="Review and manually match any unmatched products from this channel"
-                      onClick={async () => {
-                        const URL = (import.meta as any).env?.VITE_API_URL || 'http://localhost:8080/api/v1';
-                        try {
-                          await fetch(`${URL}/marketplace/credentials/${cred.credential_id}/auto-link`, { method: 'POST', headers: { 'Content-Type': 'application/json', 'X-Tenant-Id': getActiveTenantId() } });
-                          navigate(`/marketplace/channels/${cred.credential_id}/reconcile`);
-                        } catch { alert('Auto-link failed'); }
-                      }}
-                      style={{
-                        height: 30, padding: '0 10px', borderRadius: 6,
-                        background: 'var(--bg-tertiary)',
-                        border: '1px solid var(--border)',
-                        cursor: 'pointer', fontSize: 12, fontWeight: 600,
-                        display: 'inline-flex', alignItems: 'center', gap: 5,
-                        color: 'var(--primary, #6366f1)',
-                        whiteSpace: 'nowrap',
-                        transition: 'background 0.1s',
-                      }}
-                    >
-                      🔗 Review Matches
-                    </button>
-                    <ActionIconBtn title="Test connection" onClick={() => handleTest(cred.credential_id)} disabled={testingId === cred.credential_id}>
-                      {testingId === cred.credential_id ? '⏳' : '🔌'}
-                    </ActionIconBtn>
-                    <ActionIconBtn title="Remove" onClick={() => handleDelete(cred.credential_id)} danger>🗑️</ActionIconBtn>
+                    {cred.last_test_status === 'failed' ? (
+                      /* Credential has a failed token — show reconnect banner + button */
+                      <>
+                        <div style={{
+                          display: 'flex', alignItems: 'center', gap: 8,
+                          padding: '6px 10px', borderRadius: 8,
+                          background: 'rgba(239,68,68,0.08)',
+                          border: '1px solid rgba(239,68,68,0.3)',
+                        }}>
+                          <span style={{ fontSize: 11, color: 'var(--danger)', fontWeight: 600 }}>
+                            ⚠️ Token expired
+                          </span>
+                          <button
+                            onClick={() => handleReconnect(cred)}
+                            style={{
+                              height: 26, padding: '0 12px', borderRadius: 6,
+                              background: 'var(--danger)', border: 'none',
+                              cursor: 'pointer', fontSize: 12, fontWeight: 700,
+                              color: '#fff', whiteSpace: 'nowrap',
+                              display: 'inline-flex', alignItems: 'center', gap: 4,
+                            }}
+                          >
+                            🔁 Reconnect Account
+                          </button>
+                        </div>
+                        <ActionIconBtn title="Remove" onClick={() => handleDelete(cred.credential_id)} danger>🗑️</ActionIconBtn>
+                      </>
+                    ) : (
+                      /* Normal actions for healthy credentials */
+                      <>
+                        <ActionIconBtn title="Configure" onClick={() => navigate(`/marketplace/channels/${cred.credential_id}/config`)}>⚙️</ActionIconBtn>
+                        <button
+                          title="Review and manually match any unmatched products from this channel"
+                          onClick={async () => {
+                            const URL = (import.meta as any).env?.VITE_API_URL || 'http://localhost:8080/api/v1';
+                            try {
+                              await fetch(`${URL}/marketplace/credentials/${cred.credential_id}/auto-link`, { method: 'POST', headers: { 'Content-Type': 'application/json', 'X-Tenant-Id': getActiveTenantId() } });
+                              navigate(`/marketplace/channels/${cred.credential_id}/reconcile`);
+                            } catch { alert('Auto-link failed'); }
+                          }}
+                          style={{
+                            height: 30, padding: '0 10px', borderRadius: 6,
+                            background: 'var(--bg-tertiary)',
+                            border: '1px solid var(--border)',
+                            cursor: 'pointer', fontSize: 12, fontWeight: 600,
+                            display: 'inline-flex', alignItems: 'center', gap: 5,
+                            color: 'var(--primary, #6366f1)',
+                            whiteSpace: 'nowrap',
+                            transition: 'background 0.1s',
+                          }}
+                        >
+                          🔗 Review Matches
+                        </button>
+                        <ActionIconBtn title="Test connection" onClick={() => handleTest(cred.credential_id)} disabled={testingId === cred.credential_id}>
+                          {testingId === cred.credential_id ? '⏳' : '🔌'}
+                        </ActionIconBtn>
+                        <ActionIconBtn title="Remove" onClick={() => handleDelete(cred.credential_id)} danger>🗑️</ActionIconBtn>
+                      </>
+                    )}
                   </div>
                 </div>
               );
@@ -1981,7 +2041,7 @@ export default function MarketplaceConnections() {
             </div>
             <div style={{ padding: 24 }}>
               {selectedAdapter.id === 'amazon' && (<><div style={{ padding: 12, marginBottom: 16, borderRadius: 8, background: '#FF990018', border: '1px solid #FF990055', color: 'var(--text-primary)', fontSize: 13 }}><div style={{ fontWeight: 700, marginBottom: 4 }}>📦 Amazon SP-API — OAuth Connection</div><div style={{ color: 'var(--text-secondary)' }}>Click below to open Amazon Seller Central and authorise MarketMate. Each marketplace (UK, US, DE etc.) requires a separate connection.</div></div><div style={{ marginBottom: 16 }}><label style={labelStyle}>Marketplace <span style={{ color: 'var(--danger)' }}>*</span></label><select className="input" style={{ width: '100%' }} value={formValues.marketplace_id || 'A1F83G8C2ARO7P'} onChange={e => setFormValues(prev => ({ ...prev, marketplace_id: e.target.value }))}><option value="A1F83G8C2ARO7P">🇬🇧 Amazon UK</option><option value="ATVPDKIKX0DER">🇺🇸 Amazon US</option><option value="A1PA6795UKMFR9">🇩🇪 Amazon DE</option><option value="A13V1IB3VIYZZH">🇫🇷 Amazon FR</option><option value="APJ6JRA9NG5V4">🇮🇹 Amazon IT</option><option value="A1RKKUPIHCS9HS">🇪🇸 Amazon ES</option></select></div></>)}
-              {selectedAdapter.id === 'amazon' && (<div style={{ padding: 12, marginBottom: 16, borderRadius: 8, background: 'var(--info-glow)', border: '1px solid var(--info)', color: 'var(--info)', fontSize: 13 }}>ℹ Company API keys (LWA Client, AWS) are configured globally. Enter your Refresh Token, Marketplace ID and Seller ID below.</div>)}
+              
               {selectedAdapter.id === 'temu' && (<div style={{ padding: 12, marginBottom: 16, borderRadius: 8, background: '#FF6B351A', border: '1px solid #FF6B3555', color: 'var(--text-primary)', fontSize: 13 }}><div style={{ fontWeight: 700, marginBottom: 4 }}>🛍️ Temu Open Platform</div><div style={{ color: 'var(--text-secondary)' }}>Company API keys are configured globally. Enter your Access Token below.</div></div>)}
               {selectedAdapter.id === 'ebay' && (<><div style={{ padding: 12, marginBottom: 16, borderRadius: 8, background: '#E532381A', border: '1px solid #E5323855', color: 'var(--text-primary)', fontSize: 13 }}><div style={{ fontWeight: 700, marginBottom: 4 }}>🏷️ eBay Developer Program</div><div style={{ color: 'var(--text-secondary)' }}>Company API keys are configured globally. Enter your Refresh Token below.</div></div><div style={{ display: 'flex', gap: 8, marginBottom: 16 }}>{([{ key: true, label: '🔑 Manual Entry', desc: 'Paste refresh token' }, { key: false, label: '🔗 OAuth Login', desc: 'Sign in via eBay' }] as const).map(opt => (<div key={String(opt.key)} onClick={() => setEbayManualEntry(opt.key)} style={{ flex: 1, padding: '10px 12px', borderRadius: 8, cursor: 'pointer', textAlign: 'center', background: ebayManualEntry === opt.key ? '#0064D215' : 'var(--bg-tertiary)', border: `1px solid ${ebayManualEntry === opt.key ? '#0064D2' : 'var(--border)'}` }}><div style={{ fontWeight: 600, fontSize: 13, color: ebayManualEntry === opt.key ? '#0064D2' : 'var(--text-primary)' }}>{opt.label}</div><div style={{ fontSize: 11, color: 'var(--text-muted)', marginTop: 2 }}>{opt.desc}</div></div>))}</div></>)}
               {selectedAdapter.id === 'shopify' && (<><div style={{ padding: 12, marginBottom: 16, borderRadius: 8, background: '#96BF481A', border: '1px solid #96BF4855', color: 'var(--text-primary)', fontSize: 13 }}><div style={{ fontWeight: 700, marginBottom: 4 }}>🛍️ Shopify — OAuth Connection</div><div style={{ color: 'var(--text-secondary)' }}>Enter your store domain below. You'll be redirected to Shopify to authorise access. You can connect multiple Shopify stores — each gets its own connection.</div></div><div style={{ marginBottom: 16 }}><label style={labelStyle}>Store Domain <span style={{ color: 'var(--danger)' }}>*</span></label><input className="input" style={{ width: '100%' }} placeholder="mystore.myshopify.com" value={formValues.shop_domain || ''} onChange={e => setFormValues(prev => ({ ...prev, shop_domain: e.target.value.trim() }))} autoComplete="off" /><div style={{ fontSize: 11, color: 'var(--text-muted)', marginTop: 4 }}>Enter just the domain — e.g. <strong>mystore.myshopify.com</strong></div></div></>)}
