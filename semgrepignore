@@ -1,0 +1,18 @@
+# .semgrepignore — place at C:\Users\Mrste\Documents\platform\.semgrepignore
+#
+# Ops/maintenance scripts — never deployed to production, inputs are never
+# user-supplied. Excluded from semgrep to suppress subprocess-shell-true
+# and dynamic-urllib-use-detected false positives.
+reenrich_failed.py
+retry_enrich_tasks.py
+clear_enrichment_v2.py
+clear_enrichment_v3.py
+temu_order_diagnostic.py
+backend/reenrich_failed.py
+backend/retry_enrich_tasks.py
+
+# Duplicate file in docs — should be deleted
+docs/
+
+# Minified build output — dangerouslySetInnerHTML findings are not in source
+frontend/dist/

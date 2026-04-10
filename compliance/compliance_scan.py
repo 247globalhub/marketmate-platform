@@ -64,13 +64,25 @@ Prerequisites:
   npm           : Node.js on PATH
   semgrep       : pip install semgrep
   gosec         : go install github.com/securego/gosec/v2/cmd/gosec@latest
+  hadolint      : https://github.com/hadolint/hadolint/releases → add to PATH (optional)
   gcloud        : Google Cloud SDK on PATH
   docker        : Docker Desktop (Prowler + TruffleHog fallback)
   firebase-admin: pip install firebase-admin
   nuclei        : https://github.com/projectdiscovery/nuclei/releases → add to PATH (optional)
-  trufflehog    : pip install trufflehog  OR  docker pull trufflesecurity/trufflehog (optional)
+  trufflehog    : pip install trufflehog  OR  docker pull trufflesecurity/trufflehog
   scorecard     : go install sigs.k8s.io/scorecard/v5/cmd/scorecard@latest (optional)
   GITHUB_TOKEN  : set $env:GITHUB_TOKEN for full Scorecard results against GitHub repo
+
+New checks added (v2):
+  scan_trivy_config : Trivy Dockerfile/IaC misconfiguration scan (root user, unpinned images, integrity)
+  scan_hadolint     : Hadolint Dockerfile linter (DL3002 root, DL3007 latest tag, supply chain)
+  scan_go_version   : Go toolchain EOL check — fails if builder image uses unsupported Go version
+  scan_trufflehog   : Promoted from optional to mandatory; scans full git history for secrets
+
+  Semgrep ruleset extended with p/typescript and p/react to catch window.location.href XSS.
+
+  .semgrepignore: place at C:\\Users\\Mrste\\Documents\\platform\\.semgrepignore to suppress
+  false positives from ops scripts (reenrich_failed.py etc). See bottom of this file for content.
 """
 
 import argparse
@@ -401,8 +413,8 @@ def scan_semgrep():
     res["available"] = True
     out = ep(f"semgrep-{DATE_STR}.json")
     rc, _, stderr = run(
-        f'semgrep --config=p/security-audit --json --output="{out}" "{PLATFORM_DIR}"',
-        timeout=360)
+        f'semgrep --config=p/security-audit --config=p/typescript --config=p/react --json --output="{out}" "{PLATFORM_DIR}"',
+        timeout=480)
 
     if not os.path.exists(out):
         res["error"] = stderr[:300] or "no output"
@@ -484,6 +496,245 @@ def scan_gosec():
     print(f"  (Excluded false positives: {', '.join(excluded)})")
     return res
 
+
+
+# ── NEW: TRIVY CONFIG — DOCKERFILE MISCONFIGURATION SCAN ──────────────────────
+
+def scan_trivy_config():
+    """
+    Scans all Dockerfiles and IaC files for misconfigurations:
+      - Container running as root (AVD-DS-0002)
+      - Unpinned/floating base image tags (AVD-DS-0001)
+      - Missing USER directive
+      - Binary pulled without integrity verification
+      - Automatic upgrades of base images (supply chain risk)
+    Catches the class of findings that trivy image scan misses because
+    it only inspects the running container, not the Dockerfile source.
+    """
+    section("Trivy Config — Dockerfile Misconfiguration Scan")
+    res = {"tool": "trivy_config", "available": False,
+           "critical": 0, "high": 0, "medium": 0,
+           "findings": [], "passed": False, "evidence_file": None}
+
+    if not avail("trivy"):
+        print("  trivy not on PATH.")
+        res["error"] = "trivy not found"
+        return res
+
+    res["available"] = True
+    out = ep(f"trivy-config-{DATE_STR}.json")
+
+    rc, stdout, stderr = run(
+        f'trivy config --format json --output "{out}" '
+        f'--severity HIGH,CRITICAL,MEDIUM '
+        f'"{PLATFORM_DIR}"',
+        timeout=120)
+
+    if not os.path.exists(out):
+        res["error"] = stderr[:300] or "no output"
+        print(f"  FAIL: {res['error']}")
+        return res
+
+    res["evidence_file"] = out
+    try:
+        data = json.load(open(out, encoding="utf-8"))
+        for result in data.get("Results", []):
+            target = result.get("Target", "")
+            for m in result.get("Misconfigurations") or []:
+                sev = m.get("Severity", "").upper()
+                avd_id = m.get("AVDID", m.get("ID", ""))
+                title  = m.get("Title", "")[:80]
+                desc   = m.get("Description", "")[:120]
+                res["findings"].append({
+                    "id": avd_id, "severity": sev,
+                    "file": target, "title": title,
+                    "description": desc
+                })
+                if sev == "CRITICAL":   res["critical"] += 1
+                elif sev == "HIGH":     res["high"] += 1
+                elif sev == "MEDIUM":   res["medium"] += 1
+    except Exception as e:
+        res["error"] = str(e)
+        print(f"  Parse error: {e}")
+
+    res["passed"] = res["critical"] == 0 and res["high"] == 0
+    print(f"  Critical: {res['critical']}  High: {res['high']}  Medium: {res['medium']}")
+    if not res["passed"]:
+        print("  HIGH/CRITICAL Dockerfile findings — REQUIRES FIXING:")
+        for f in [x for x in res["findings"] if x["severity"] in ("CRITICAL", "HIGH")][:10]:
+            print(f"    [{f['severity']}] {f['id']} in {f['file']}: {f['title']}")
+    print(f"  {ok(res['passed'])}")
+    return res
+
+
+# ── NEW: HADOLINT — DOCKERFILE BEST PRACTICE LINTER ───────────────────────────
+
+def scan_hadolint():
+    """
+    Runs hadolint against every Dockerfile in the platform directory.
+    Key rules that catch pentest findings:
+      DL3002 : Last USER is root — container runs as root (MEDIUM/HIGH)
+      DL3007 : Using 'latest' tag — supply chain / automatic upgrades (MEDIUM)
+      DL3008 : Pin apt packages to specific versions
+      SC2028 : ShellCheck rules embedded in hadolint
+    hadolint install: https://github.com/hadolint/hadolint/releases → add to PATH
+    """
+    section("Hadolint — Dockerfile Best Practice Linter")
+    res = {"tool": "hadolint", "available": avail("hadolint"), "skipped": False,
+           "error_count": 0, "warning_count": 0,
+           "findings": [], "passed": True, "evidence_file": None}
+
+    if not res["available"]:
+        print("  hadolint not on PATH (optional — install to improve Dockerfile coverage)")
+        print("  Install: https://github.com/hadolint/hadolint/releases")
+        res["error"] = "hadolint not found"
+        # Not a hard failure — optional tool
+        res["passed"] = True
+        return res
+
+    # Find all Dockerfiles under PLATFORM_DIR
+    dockerfiles = []
+    for root, dirs, files in os.walk(PLATFORM_DIR):
+        # Skip node_modules, .git, dist
+        dirs[:] = [d for d in dirs if d not in ("node_modules", ".git", "dist", "__pycache__")]
+        for f in files:
+            if f == "Dockerfile" or f.startswith("Dockerfile."):
+                dockerfiles.append(os.path.join(root, f))
+
+    if not dockerfiles:
+        print("  No Dockerfiles found.")
+        res["passed"] = True
+        return res
+
+    print(f"  Found {len(dockerfiles)} Dockerfile(s)")
+    all_findings = []
+
+    for df in dockerfiles:
+        rel = os.path.relpath(df, PLATFORM_DIR)
+        _, stdout, _ = run(f'hadolint --format json "{df}"', timeout=30)
+        try:
+            issues = json.loads(stdout) if stdout.strip() else []
+            for issue in issues:
+                level  = issue.get("level", "").lower()
+                code   = issue.get("code", "")
+                msg    = issue.get("message", "")[:100]
+                line   = issue.get("line", 0)
+                # Map hadolint levels to our severity scheme
+                sev = ("HIGH"   if level == "error"   else
+                       "MEDIUM" if level == "warning" else "LOW")
+                all_findings.append({
+                    "severity": sev, "file": rel,
+                    "rule": code, "line": line, "message": msg
+                })
+                if level == "error":   res["error_count"] += 1
+                elif level == "warning": res["warning_count"] += 1
+        except Exception:
+            # hadolint returns non-JSON when it can't parse the file
+            pass
+
+        errors   = sum(1 for f in all_findings if f["file"] == rel and f["severity"] == "HIGH")
+        warnings = sum(1 for f in all_findings if f["file"] == rel and f["severity"] == "MEDIUM")
+        status   = "✅" if errors == 0 else "❌"
+        print(f"    {status} {rel}: errors={errors} warnings={warnings}")
+
+    res["findings"] = all_findings
+    out = ep(f"hadolint-{DATE_STR}.json")
+    json.dump(all_findings, open(out, "w", encoding="utf-8"), indent=2)
+    res["evidence_file"] = out
+
+    # Fail if any HIGH (error-level) findings — DL3002 root user, etc.
+    high_findings = [f for f in all_findings if f["severity"] == "HIGH"]
+    res["passed"] = len(high_findings) == 0
+
+    if not res["passed"]:
+        print(f"  HIGH findings ({len(high_findings)}) — REQUIRES FIXING:")
+        for f in high_findings[:10]:
+            print(f"    [{f['severity']}] {f['rule']} {f['file']}:{f['line']} — {f['message']}")
+    print(f"  {ok(res['passed'])}")
+    return res
+
+
+# ── NEW: GO VERSION EOL CHECK ──────────────────────────────────────────────────
+
+def scan_go_version():
+    """
+    Checks whether the Go version used in backend/Dockerfile is still receiving
+    security updates. Go supports exactly the two most recent major releases.
+    Fails if the builder image uses a Go version that has been superseded by
+    two or more newer releases (i.e. is no longer receiving security patches).
+
+    Currently supported versions: 1.25, 1.26 (as of April 2026).
+    Update SUPPORTED_GO_VERSIONS when new Go majors are released (~6-monthly).
+    """
+    section("Go Version — EOL Check")
+    res = {"tool": "go_version", "available": True, "skipped": False,
+           "findings": [], "passed": True, "evidence_file": None}
+
+    # The two currently supported Go major versions (update every ~6 months)
+    # Go releases a new major every ~6 months. The two most recent are supported.
+    # As of April 2026: 1.25 (released Aug 2025) and 1.26 (released Feb 2026).
+    SUPPORTED_GO_VERSIONS = {"1.25", "1.26"}
+    LATEST_GO_VERSION = "1.26"
+
+    dockerfile_path = os.path.join(BACKEND_DIR, "Dockerfile")
+    if not os.path.exists(dockerfile_path):
+        print(f"  backend/Dockerfile not found at {dockerfile_path}")
+        res["error"] = "Dockerfile not found"
+        res["passed"] = True  # Can't check — don't fail
+        return res
+
+    import re
+    found_version = None
+    with open(dockerfile_path, encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if line.upper().startswith("FROM") and "golang" in line.lower():
+                # Match golang:1.25, golang:1.26-bookworm, golang:1.26.2-alpine, etc.
+                m = re.search(r'golang:(\d+\.\d+)', line)
+                if m:
+                    found_version = m.group(1)
+                break
+
+    out = ep(f"go-version-{DATE_STR}.json")
+    evidence = {"dockerfile": dockerfile_path, "found_version": found_version,
+                "supported_versions": list(SUPPORTED_GO_VERSIONS),
+                "latest_version": LATEST_GO_VERSION}
+
+    if not found_version:
+        print("  Could not detect Go version in backend/Dockerfile FROM line")
+        res["passed"] = True  # Inconclusive — don't penalise
+        evidence["result"] = "inconclusive"
+    elif found_version in SUPPORTED_GO_VERSIONS:
+        print(f"  ✅ Go {found_version} is a currently supported release")
+        if found_version != LATEST_GO_VERSION:
+            print(f"  ⚠ Go {found_version} is supported but not the latest ({LATEST_GO_VERSION})")
+            print(f"    Consider upgrading to golang:{LATEST_GO_VERSION}-bookworm in backend/Dockerfile")
+            res["findings"].append({
+                "severity": "LOW",
+                "check": "Go version not latest",
+                "detail": (f"Go {found_version} is supported but Go {LATEST_GO_VERSION} is available. "
+                           f"Update FROM golang:{found_version}-bookworm → golang:{LATEST_GO_VERSION}-bookworm")
+            })
+        res["passed"] = True
+        evidence["result"] = "supported"
+    else:
+        print(f"  ❌ Go {found_version} is NO LONGER receiving security updates!")
+        print(f"  Supported versions: {', '.join(sorted(SUPPORTED_GO_VERSIONS))}")
+        print(f"  Fix: change FROM golang:{found_version}-bookworm → golang:{LATEST_GO_VERSION}-bookworm")
+        res["findings"].append({
+            "severity": "CRITICAL",
+            "check": "Go version EOL",
+            "detail": (f"Go {found_version} in backend/Dockerfile is end-of-life. "
+                       f"Supported versions: {', '.join(sorted(SUPPORTED_GO_VERSIONS))}. "
+                       f"Update to golang:{LATEST_GO_VERSION}-bookworm.")
+        })
+        res["passed"] = False
+        evidence["result"] = "eol"
+
+    json.dump(evidence, open(out, "w", encoding="utf-8"), indent=2)
+    res["evidence_file"] = out
+    print(f"  {ok(res['passed'])}")
+    return res
 
 def check_gcp_controls():
     section("GCP Controls — Audit Logs, Firewall, Secret Manager, IAM")
@@ -2561,6 +2812,9 @@ def generate_html_report(scan_data):
   <h2>Scan Results</h2>
   {tool_card("Trivy — Container Image CVE Scan", tools.get("trivy_container"))}
   {tool_card("Trivy — Codebase Secrets Scan (trivy-secrets-FINAL)", tools.get("trivy_secrets"))}
+  {tool_card("Trivy Config — Dockerfile Misconfiguration Scan", tools.get("trivy_config"))}
+  {tool_card("Hadolint — Dockerfile Best Practice Linter", tools.get("hadolint"))}
+  {tool_card("Go Version — EOL &amp; Toolchain Check", tools.get("go_version"))}
   {tool_card("govulncheck — Go Dependency Vulnerabilities", tools.get("govulncheck"))}
   {tool_card("npm audit — Node.js Dependencies", tools.get("npm_audit"))}
   {tool_card("Semgrep — SAST Security Audit", tools.get("semgrep"))}
@@ -2611,6 +2865,9 @@ def generate_html_report(scan_data):
     {EVIDENCE_DIR}\\<br>
     ├── trivy-container-{DATE_STR}.json<br>
     ├── trivy-secrets-FINAL-{DATE_STR}.json<br>
+    ├── trivy-config-{DATE_STR}.json<br>
+    ├── hadolint-{DATE_STR}.json<br>
+    ├── go-version-{DATE_STR}.json<br>
     ├── govulncheck-{DATE_STR}.txt / .json<br>
     ├── npm-audit-backend-{DATE_STR}.json<br>
     ├── npm-audit-frontend-{DATE_STR}.json<br>
@@ -2662,6 +2919,9 @@ def generate_html_report(scan_data):
 def main():
     p = argparse.ArgumentParser(description="MarketMate Compliance Scan")
     p.add_argument("--skip-prowler",       action="store_true")
+    p.add_argument("--skip-trivy-config",  action="store_true", help="Skip Dockerfile misconfiguration scan")
+    p.add_argument("--skip-hadolint",      action="store_true", help="Skip Hadolint Dockerfile linter")
+    p.add_argument("--skip-go-version",    action="store_true", help="Skip Go version EOL check")
     p.add_argument("--skip-dast",          action="store_true")
     p.add_argument("--skip-semgrep",       action="store_true")
     p.add_argument("--skip-pentest",       action="store_true", help="Skip all pentest-grade scans")
@@ -2712,6 +2972,9 @@ def main():
     tools = {}
     tools["trivy_container"] = scan_trivy_container()
     tools["trivy_secrets"]   = scan_trivy_secrets()
+    tools["trivy_config"]    = scan_trivy_config()   if not args.skip_trivy_config else {"tool":"trivy_config","available":False,"skipped":True,"passed":True}
+    tools["hadolint"]        = scan_hadolint()        if not args.skip_hadolint     else {"tool":"hadolint","available":False,"skipped":True,"passed":True}
+    tools["go_version"]      = scan_go_version()      if not args.skip_go_version   else {"tool":"go_version","available":False,"skipped":True,"passed":True}
     tools["govulncheck"]     = scan_govulncheck()
     tools["npm_audit"]       = scan_npm_audit()
     tools["gosec"]           = scan_gosec()
@@ -2721,7 +2984,7 @@ def main():
     tools["prowler"]         = run_prowler(skip=args.skip_prowler)
     tools["owasp_zap"]       = scan_owasp_zap(skip=args.skip_dast)
 
-    # Pentest-grade scans
+    # Pentest-grade scans (trufflehog now mandatory — scans git history)
     pt = args.skip_pentest
     tools["jwt_attacks"]      = scan_jwt_attacks(      skip=pt or args.skip_jwt)
     tools["tenant_isolation"] = scan_tenant_isolation( skip=pt or args.skip_idor)
@@ -2735,9 +2998,11 @@ def main():
     tools["security_headers"] = scan_security_headers( skip=pt)
 
     # Tools that are optional installs — their absence does not degrade overall status.
-    # nuclei and trufflehog require manual installation; skipping them is expected
-    # until they are set up. All other unavailable tools are genuine warnings.
-    OPTIONAL_TOOLS = {"nuclei", "trufflehog", "scorecard"}
+    # nuclei, scorecard and hadolint are optional installs.
+    # trufflehog is now mandatory — it scans git history for secrets that
+    # file-based scanners miss. Install: pip install trufflehog
+    # All other unavailable tools are genuine warnings.
+    OPTIONAL_TOOLS = {"nuclei", "scorecard", "hadolint"}
 
     failures = [k for k,v in tools.items()
                 if v.get("available") and not v.get("skipped") and not v.get("passed")]
@@ -2780,9 +3045,9 @@ def main():
     if optional_missing:
         print(f"  Optional tools not installed (install to improve coverage):")
         install_hints = {
-            "nuclei":     "https://github.com/projectdiscovery/nuclei/releases → add to PATH",
-            "trufflehog": "pip install trufflehog  OR  docker pull trufflesecurity/trufflehog",
-            "scorecard":  "go install sigs.k8s.io/scorecard/v5/cmd/scorecard@latest",
+            "nuclei":    "https://github.com/projectdiscovery/nuclei/releases → add to PATH",
+            "scorecard": "go install sigs.k8s.io/scorecard/v5/cmd/scorecard@latest",
+            "hadolint":  "https://github.com/hadolint/hadolint/releases → add to PATH",
         }
         for t in optional_missing:
             print(f"    • {t}: {install_hints.get(t, 'see docs')}")

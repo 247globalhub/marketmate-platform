@@ -1,4 +1,5 @@
 import { useState, useEffect, useCallback, useRef } from 'react';
+import { useNavigate } from 'react-router-dom';
 import { getActiveTenantId } from '../contexts/TenantContext';
 import './ImportExport.css';
 
@@ -355,6 +356,7 @@ function ExportPanel() {
 // Shows live record counts during import — no Download button.
 
 function ImportActivityPanel() {
+  const navigate = useNavigate();
   const [mpJobs, setMpJobs] = useState<MarketplaceImportJob[]>([]);
   const [credentials, setCredentials] = useState<{ credential_id: string; account_name: string; channel: string }[]>([]);
   const [loading, setLoading] = useState(true);
@@ -496,7 +498,7 @@ function ImportActivityPanel() {
 
                 return (
                   <tr key={job.job_id} style={{ cursor: 'pointer' }}
-                      onClick={() => window.location.href = `/marketplace/import/${job.job_id}`}>
+                      onClick={() => navigate(`/marketplace/import/${job.job_id}`)}>
                     <td>
                       <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
                         <span style={{ fontSize: 18 }}>{adapterEmoji[job.channel] || '🌐'}</span>
@@ -554,7 +556,7 @@ function ImportActivityPanel() {
                         <button
                           className="ie-link-btn ie-link-danger"
                           style={{ fontSize: 12, fontWeight: 700 }}
-                          onClick={e => { e.stopPropagation(); window.location.href = `/marketplace/import/${job.job_id}#errors`; }}
+                          onClick={e => { e.stopPropagation(); navigate(`/marketplace/import/${job.job_id}#errors`); }}
                           title="View error details"
                         >
                           {job.failed_items} ⚠
@@ -576,7 +578,7 @@ function ImportActivityPanel() {
                         <button
                           className="ie-btn-primary ie-btn-sm"
                           style={{ background: '#f59e0b', borderColor: '#f59e0b', fontSize: 11, whiteSpace: 'nowrap' }}
-                          onClick={e => { e.stopPropagation(); window.location.href = `/marketplace/import/${job.job_id}/review-matches`; }}
+                          onClick={e => { e.stopPropagation(); navigate(`/marketplace/import/${job.job_id}/review-matches`); }}
                         >
                           ⚠ Review Matches
                         </button>

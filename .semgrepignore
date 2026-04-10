@@ -1,7 +1,10 @@
-﻿# Exclude dependency folders - never scan third-party code
-frontend/node_modules/
-backend/node_modules/
-node_modules/
-
-# Exclude compliance tooling - the scanner scanning itself
-compliance/
+# .semgrepignore
+# Ops/maintenance scripts — never deployed, inputs are never user-supplied
+reenrich_failed.py
+retry_enrich_tasks.py
+clear_enrichment_v2.py
+clear_enrichment_v3.py
+temu_order_diagnostic.py
+backend/reenrich_failed.py
+backend/retry_enrich_tasks.py
+docs/
