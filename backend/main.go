@@ -385,7 +385,7 @@ func main() {
 	globalConfigRepo := repository.NewGlobalConfigRepository(firestoreRepo.GetClient())
 
 	// Seed global marketplace keys from environment variables
-	seedGlobalMarketplaceKeys(ctx, globalConfigRepo)
+	go seedGlobalMarketplaceKeys(ctx, globalConfigRepo)
 
 	// Initialize Storage Service
 	storageService, err := services.NewStorageService(gcsCredentials, gcsBucket)
