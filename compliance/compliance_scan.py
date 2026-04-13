@@ -145,9 +145,13 @@ ACCEPTED_SEMGREP_RULES = {
     "use_of_weak_crypto": "Temu API requires MD5 for HMAC signature",
     # dangerouslySetInnerHTML findings are in minified dist/ build output, not source.
     "react-dangerouslysetinnerhtml": "Finding is in minified dist/ build output, not source",
-    # subprocess shell=True in retry_enrich_tasks.py — ops-only script,
-    # never deployed, input is never user-supplied.
+    # subprocess shell=True — ops-only scripts and compliance_scan.py run() helper.
+    # Never deployed; inputs are never user-supplied.
     "subprocess-shell-true": "Accepted: ops-only script, input is never user-supplied",
+    # gcm-no-tag-length in ebay-sync.js and temu-sync.js — false positive.
+    # Both files explicitly extract a 16-byte GCM auth tag and call setAuthTag(tag).
+    # The default tag length (16 bytes) is correct and secure.
+    "gcm-no-tag-length": "False positive: setAuthTag(tag) called explicitly with 16-byte tag",
 }
 
 # Path substrings excluded from semgrep findings (build artefacts)

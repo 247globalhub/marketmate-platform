@@ -11,6 +11,16 @@ temu_order_diagnostic.py
 backend/reenrich_failed.py
 backend/retry_enrich_tasks.py
 
+# Compliance scan script — uses subprocess shell=True intentionally in run() helper.
+# This is an internal ops tool, never deployed, inputs are never user-supplied.
+compliance/compliance_scan.py
+
+# Sync utility scripts at repo root — ops/diagnostic tools, never deployed.
+# gcm-no-tag-length false positive: both files explicitly extract and set a
+# 16-byte GCM auth tag via setAuthTag(tag) — the default tag length is correct.
+ebay-sync.js
+temu-sync.js
+
 # Duplicate file in docs — should be deleted
 docs/
 
