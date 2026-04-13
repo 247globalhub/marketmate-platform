@@ -10,6 +10,8 @@ $SERVICE  = "marketmate-api"
 Write-Host "Restoring marketmate-api env vars..." -ForegroundColor Cyan
 
 gcloud run services update $SERVICE `
+  --startup-probe="failureThreshold=5,periodSeconds=240,tcpSocket.port=8080" `
+  --no-traffic `
   --project=$PROJECT `
   --region=$REGION `
   --update-env-vars=`
